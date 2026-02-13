@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { resolveQueueSettings } from "../auto-reply/reply/queue.js";
+import { enqueueAutonomyEvent } from "../autonomy/store.js";
 import { loadConfig } from "../config/config.js";
 import {
   loadSessionStore,
@@ -413,6 +414,29 @@ export async function runSubagentAnnounceFlow(params: {
 
     if (!outcome) {
       outcome = { status: "unknown" };
+    }
+
+    // Feed subagent completion into the autonomy event inbox so background
+    // autonomous loops can react on the next cycle.
+    try {
+      const requesterAgentId = resolveAgentIdFromSessionKey(params.requesterSessionKey);
+      await enqueueAutonomyEvent({
+        agentId: requesterAgentId,
+        source: "subagent",
+        type: "subagent.completed",
+        dedupeKey: params.childRunId,
+        payload: {
+          childRunId: params.childRunId,
+          childSessionKey: params.childSessionKey,
+          requesterSessionKey: params.requesterSessionKey,
+          status: outcome.status,
+          error: outcome.error,
+          label: params.label,
+          task: params.task,
+        },
+      });
+    } catch {
+      // best-effort only
     }
 
     // Build stats

@@ -10,6 +10,29 @@ export type CronWakeMode = "next-heartbeat" | "now";
 
 export type CronMessageChannel = ChannelId | "last";
 
+export type CronAutonomyEventSource = "cron" | "webhook" | "email" | "subagent" | "manual";
+
+export type CronAutonomyConfig = {
+  enabled?: boolean;
+  paused?: boolean;
+  mission?: string;
+  goalsFile?: string;
+  tasksFile?: string;
+  logFile?: string;
+  maxActionsPerRun?: number;
+  dedupeWindowMinutes?: number;
+  maxQueuedEvents?: number;
+  dailyTokenBudget?: number;
+  dailyCycleBudget?: number;
+  maxConsecutiveErrors?: number;
+  autoPauseOnBudgetExhausted?: boolean;
+  autoResumeOnNewDayBudgetPause?: boolean;
+  errorPauseMinutes?: number;
+  staleTaskHours?: number;
+  emitDailyReviewEvents?: boolean;
+  emitWeeklyReviewEvents?: boolean;
+};
+
 export type CronPayload =
   | { kind: "systemEvent"; text: string }
   | {
@@ -24,6 +47,7 @@ export type CronPayload =
       channel?: CronMessageChannel;
       to?: string;
       bestEffortDeliver?: boolean;
+      autonomy?: CronAutonomyConfig;
     };
 
 export type CronPayloadPatch =
@@ -39,6 +63,7 @@ export type CronPayloadPatch =
       channel?: CronMessageChannel;
       to?: string;
       bestEffortDeliver?: boolean;
+      autonomy?: CronAutonomyConfig;
     };
 
 export type CronIsolation = {

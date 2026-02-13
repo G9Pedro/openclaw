@@ -614,6 +614,10 @@
       "destination": "/experiments/plans/group-policy-hardening"
     },
     {
+      "source": "/plans/autonomy-self-augmentation-execution-board",
+      "destination": "/experiments/plans/autonomy-self-augmentation-execution-board"
+    },
+    {
       "source": "/poll",
       "destination": "/automation/poll"
     },
@@ -1130,6 +1134,7 @@
         "pages": [
           "testing",
           "scripts",
+          "experiments/plans/autonomy-self-augmentation-execution-board",
           "reference/session-management-compaction",
           "reference/rpc",
           "reference/device-models",

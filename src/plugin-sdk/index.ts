@@ -231,6 +231,7 @@ export {
   onDiagnosticEvent,
 } from "../infra/diagnostic-events.js";
 export type {
+  DiagnosticAutonomyPhaseEvent,
   DiagnosticEventPayload,
   DiagnosticHeartbeatEvent,
   DiagnosticLaneDequeueEvent,

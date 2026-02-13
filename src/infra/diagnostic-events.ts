@@ -127,6 +127,18 @@ export type DiagnosticHeartbeatEvent = DiagnosticBaseEvent & {
   queued: number;
 };
 
+export type DiagnosticAutonomyPhaseEvent = DiagnosticBaseEvent & {
+  type: "autonomy.phase";
+  agentId: string;
+  stage: string;
+  action: "enter" | "exit" | "blocked";
+  reason?: string;
+  lane?: string;
+  gapCount?: number;
+  candidateCount?: number;
+  durationMs?: number;
+};
+
 export type DiagnosticEventPayload =
   | DiagnosticUsageEvent
   | DiagnosticWebhookReceivedEvent
@@ -139,7 +151,8 @@ export type DiagnosticEventPayload =
   | DiagnosticLaneEnqueueEvent
   | DiagnosticLaneDequeueEvent
   | DiagnosticRunAttemptEvent
-  | DiagnosticHeartbeatEvent;
+  | DiagnosticHeartbeatEvent
+  | DiagnosticAutonomyPhaseEvent;
 
 export type DiagnosticEventInput = DiagnosticEventPayload extends infer Event
   ? Event extends DiagnosticEventPayload

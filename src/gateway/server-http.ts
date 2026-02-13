@@ -10,8 +10,10 @@ import { createServer as createHttpsServer } from "node:https";
 import type { CanvasHostHandler } from "../canvas-host/server.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveAgentAvatar } from "../agents/identity-avatar.js";
+import { enqueueAutonomyEvent, hasAutonomyState } from "../autonomy/store.js";
 import { handleA2uiHttpRequest } from "../canvas-host/a2ui.js";
 import { loadConfig } from "../config/config.js";
+import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
 import { handleSlackHttpRequest } from "../slack/http/index.js";
 import { handleControlUiAvatarRequest, handleControlUiHttpRequest } from "./control-ui.js";
 import { applyHookMappings } from "./hooks-mapping.js";
@@ -67,6 +69,38 @@ export function createHooksRequestHandler(
   } & HookDispatchers,
 ): HooksRequestHandler {
   const { getHooksConfig, bindHost, port, logHooks, dispatchAgentHook, dispatchWakeHook } = opts;
+  const recordExternalSignal = async (params: {
+    subPath: string;
+    payload: Record<string, unknown>;
+    sessionKey?: string;
+  }) => {
+    try {
+      const source = params.subPath === "gmail" ? "email" : "webhook";
+      const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
+      if (!(await hasAutonomyState(agentId))) {
+        return;
+      }
+      const messages = Array.isArray(params.payload.messages) ? params.payload.messages : [];
+      const firstMessage =
+        messages.length > 0 && typeof messages[0] === "object" && messages[0] !== null
+          ? (messages[0] as Record<string, unknown>)
+          : undefined;
+      const messageId = typeof firstMessage?.id === "string" ? firstMessage.id : undefined;
+      await enqueueAutonomyEvent({
+        agentId,
+        source,
+        type: `${source}.${params.subPath}.received`,
+        dedupeKey: messageId,
+        payload: {
+          path: params.subPath,
+          sessionKey: params.sessionKey,
+          messageId,
+        },
+      });
+    } catch {
+      // best-effort only
+    }
+  };
   return async (req, res) => {
     const hooksConfig = getHooksConfig();
     if (!hooksConfig) {
@@ -136,6 +170,11 @@ export function createHooksRequestHandler(
         sendJson(res, 400, { ok: false, error: normalized.error });
         return true;
       }
+      await recordExternalSignal({
+        subPath,
+        payload: payload as Record<string, unknown>,
+        sessionKey: normalized.value.sessionKey,
+      });
       const runId = dispatchAgentHook(normalized.value);
       sendJson(res, 202, { ok: true, runId });
       return true;
@@ -160,6 +199,10 @@ export function createHooksRequestHandler(
             return true;
           }
           if (mapped.action.kind === "wake") {
+            await recordExternalSignal({
+              subPath,
+              payload: payload as Record<string, unknown>,
+            });
             dispatchWakeHook({
               text: mapped.action.text,
               mode: mapped.action.mode,
@@ -172,6 +215,11 @@ export function createHooksRequestHandler(
             sendJson(res, 400, { ok: false, error: getHookChannelError() });
             return true;
           }
+          await recordExternalSignal({
+            subPath,
+            payload: payload as Record<string, unknown>,
+            sessionKey: mapped.action.sessionKey,
+          });
           const runId = dispatchAgentHook({
             message: mapped.action.message,
             name: mapped.action.name ?? "Hook",
