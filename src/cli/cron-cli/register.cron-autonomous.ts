@@ -77,6 +77,21 @@ export function registerCronAutonomousCommand(cron: Command) {
       .option("--max-consecutive-errors <n>", "Auto-pause after N consecutive errors", "5")
       .option("--auto-pause-on-budget", "Auto-pause when daily budgets are exhausted", true)
       .option("--no-auto-pause-on-budget", "Do not auto-pause when budgets are exhausted")
+      .option(
+        "--auto-resume-on-new-day-budget",
+        "Auto-resume autonomy when a new day resets budget window",
+        true,
+      )
+      .option("--no-auto-resume-on-new-day-budget", "Keep autonomy paused even after day rollover")
+      .option(
+        "--error-pause-minutes <n>",
+        "Cooldown minutes before auto-resuming after error pause",
+      )
+      .option("--stale-task-hours <n>", "Hours before blocked/in-progress tasks emit stale signals")
+      .option("--emit-daily-review-events", "Emit automatic daily self-review events", true)
+      .option("--no-emit-daily-review-events", "Disable automatic daily self-review events")
+      .option("--emit-weekly-review-events", "Emit automatic weekly evolution events", true)
+      .option("--no-emit-weekly-review-events", "Disable automatic weekly evolution events")
       .option("--deliver", "Deliver output to a channel target when configured", false)
       .option("--channel <channel>", `Delivery channel (${getCronChannelOptions()})`, "last")
       .option(
@@ -113,6 +128,11 @@ export function registerCronAutonomousCommand(cron: Command) {
           const dailyCycleBudget = parsePositiveIntOrUndefined(opts.dailyCycleBudget);
           const maxConsecutiveErrors = parsePositiveIntOrUndefined(opts.maxConsecutiveErrors) ?? 5;
           const autoPauseOnBudgetExhausted = opts.autoPauseOnBudget !== false;
+          const autoResumeOnNewDayBudgetPause = opts.autoResumeOnNewDayBudget !== false;
+          const errorPauseMinutes = parsePositiveIntOrUndefined(opts.errorPauseMinutes) ?? 240;
+          const staleTaskHours = parsePositiveIntOrUndefined(opts.staleTaskHours) ?? 24;
+          const emitDailyReviewEvents = opts.emitDailyReviewEvents !== false;
+          const emitWeeklyReviewEvents = opts.emitWeeklyReviewEvents !== false;
 
           const agentId =
             typeof opts.agent === "string" && opts.agent.trim()
@@ -153,6 +173,11 @@ export function registerCronAutonomousCommand(cron: Command) {
                 dailyCycleBudget,
                 maxConsecutiveErrors,
                 autoPauseOnBudgetExhausted,
+                autoResumeOnNewDayBudgetPause,
+                errorPauseMinutes,
+                staleTaskHours,
+                emitDailyReviewEvents,
+                emitWeeklyReviewEvents,
               },
             },
             isolation: {
@@ -270,6 +295,8 @@ export function registerCronAutonomousCommand(cron: Command) {
             [
               `agent=${state.agentId}`,
               `paused=${state.paused}`,
+              `pauseReason=${state.pauseReason ?? "none"}`,
+              `pausedAt=${state.pausedAt ?? "-"}`,
               `mission=${state.mission}`,
               `goalsFile=${state.goalsFile}`,
               `tasksFile=${state.tasksFile}`,
@@ -284,11 +311,93 @@ export function registerCronAutonomousCommand(cron: Command) {
               `safety.dailyTokenBudget=${state.safety.dailyTokenBudget ?? "unbounded"}`,
               `safety.maxConsecutiveErrors=${state.safety.maxConsecutiveErrors}`,
               `safety.autoPauseOnBudgetExhausted=${state.safety.autoPauseOnBudgetExhausted}`,
+              `safety.autoResumeOnNewDayBudgetPause=${state.safety.autoResumeOnNewDayBudgetPause}`,
+              `safety.errorPauseMinutes=${state.safety.errorPauseMinutes}`,
+              `safety.staleTaskHours=${state.safety.staleTaskHours}`,
+              `safety.emitDailyReviewEvents=${state.safety.emitDailyReviewEvents}`,
+              `safety.emitWeeklyReviewEvents=${state.safety.emitWeeklyReviewEvents}`,
+              `review.lastDailyReviewDayKey=${state.review.lastDailyReviewDayKey ?? "-"}`,
+              `review.lastWeeklyReviewKey=${state.review.lastWeeklyReviewKey ?? "-"}`,
               `metrics.cycles=${state.metrics.cycles}`,
               `metrics.ok=${state.metrics.ok}`,
               `metrics.error=${state.metrics.error}`,
               `metrics.skipped=${state.metrics.skipped}`,
               `metrics.consecutiveErrors=${state.metrics.consecutiveErrors}`,
+            ].join("\n"),
+          );
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-health")
+      .description("Summarize autonomy runtime health for an agent")
+      .requiredOption("--agent <id>", "Target agent id")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          const state = await loadAutonomyState({ agentId });
+          const cycleBudget = state.safety.dailyCycleBudget;
+          const tokenBudget = state.safety.dailyTokenBudget;
+          const cycleUsageRatio =
+            typeof cycleBudget === "number" && cycleBudget > 0
+              ? state.budget.cyclesUsed / cycleBudget
+              : undefined;
+          const tokenUsageRatio =
+            typeof tokenBudget === "number" && tokenBudget > 0
+              ? state.budget.tokensUsed / tokenBudget
+              : undefined;
+          const warnings: string[] = [];
+          if (state.metrics.consecutiveErrors > 0) {
+            warnings.push(`consecutive errors: ${state.metrics.consecutiveErrors}`);
+          }
+          if (typeof cycleUsageRatio === "number" && cycleUsageRatio >= 0.9) {
+            warnings.push(
+              `daily cycle budget near limit (${state.budget.cyclesUsed}/${cycleBudget})`,
+            );
+          }
+          if (typeof tokenUsageRatio === "number" && tokenUsageRatio >= 0.9) {
+            warnings.push(
+              `daily token budget near limit (${state.budget.tokensUsed}/${tokenBudget})`,
+            );
+          }
+          const status = state.paused ? "paused" : warnings.length > 0 ? "degraded" : "healthy";
+          const health = {
+            agentId: state.agentId,
+            status,
+            pauseReason: state.pauseReason,
+            warnings,
+            metrics: state.metrics,
+            budget: {
+              dayKey: state.budget.dayKey,
+              cyclesUsed: state.budget.cyclesUsed,
+              cycleBudget,
+              tokensUsed: state.budget.tokensUsed,
+              tokenBudget,
+            },
+          };
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(health, null, 2));
+            return;
+          }
+          defaultRuntime.log(
+            [
+              `agent=${health.agentId}`,
+              `status=${health.status}`,
+              `pauseReason=${health.pauseReason ?? "none"}`,
+              `cycles=${health.metrics.cycles} (ok=${health.metrics.ok} error=${health.metrics.error} skipped=${health.metrics.skipped})`,
+              `consecutiveErrors=${health.metrics.consecutiveErrors}`,
+              `budget.day=${health.budget.dayKey}`,
+              `budget.cycles=${health.budget.cyclesUsed}/${health.budget.cycleBudget ?? "unbounded"}`,
+              `budget.tokens=${health.budget.tokensUsed}/${health.budget.tokenBudget ?? "unbounded"}`,
+              ...(warnings.length > 0
+                ? ["warnings:", ...warnings.map((warning) => `- ${warning}`)]
+                : []),
             ].join("\n"),
           );
         } catch (err) {
@@ -332,6 +441,14 @@ export function registerCronAutonomousCommand(cron: Command) {
       .option("--max-consecutive-errors <n>", "Update max consecutive errors")
       .option("--auto-pause-on-budget", "Enable auto-pause on budget exhaustion")
       .option("--no-auto-pause-on-budget", "Disable auto-pause on budget exhaustion")
+      .option("--auto-resume-on-new-day-budget", "Enable auto-resume after budget day rollover")
+      .option("--no-auto-resume-on-new-day-budget", "Disable auto-resume after budget day rollover")
+      .option("--error-pause-minutes <n>", "Update error pause cooldown minutes")
+      .option("--stale-task-hours <n>", "Update stale task threshold hours")
+      .option("--emit-daily-review-events", "Enable daily review events")
+      .option("--no-emit-daily-review-events", "Disable daily review events")
+      .option("--emit-weekly-review-events", "Enable weekly review events")
+      .option("--no-emit-weekly-review-events", "Disable weekly review events")
       .option("--pause", "Pause autonomy")
       .option("--resume", "Resume autonomy")
       .action(async (id, opts) => {
@@ -350,6 +467,8 @@ export function registerCronAutonomousCommand(cron: Command) {
           const dailyTokenBudget = parsePositiveIntOrUndefined(opts.dailyTokenBudget);
           const dailyCycleBudget = parsePositiveIntOrUndefined(opts.dailyCycleBudget);
           const maxConsecutiveErrors = parsePositiveIntOrUndefined(opts.maxConsecutiveErrors);
+          const errorPauseMinutes = parsePositiveIntOrUndefined(opts.errorPauseMinutes);
+          const staleTaskHours = parsePositiveIntOrUndefined(opts.staleTaskHours);
           if (mission) {
             patchAutonomy.mission = mission;
           }
@@ -380,8 +499,23 @@ export function registerCronAutonomousCommand(cron: Command) {
           if (maxConsecutiveErrors) {
             patchAutonomy.maxConsecutiveErrors = maxConsecutiveErrors;
           }
+          if (errorPauseMinutes) {
+            patchAutonomy.errorPauseMinutes = errorPauseMinutes;
+          }
+          if (staleTaskHours) {
+            patchAutonomy.staleTaskHours = staleTaskHours;
+          }
           if (opts.autoPauseOnBudget === true || opts.autoPauseOnBudget === false) {
             patchAutonomy.autoPauseOnBudgetExhausted = opts.autoPauseOnBudget;
+          }
+          if (opts.autoResumeOnNewDayBudget === true || opts.autoResumeOnNewDayBudget === false) {
+            patchAutonomy.autoResumeOnNewDayBudgetPause = opts.autoResumeOnNewDayBudget;
+          }
+          if (opts.emitDailyReviewEvents === true || opts.emitDailyReviewEvents === false) {
+            patchAutonomy.emitDailyReviewEvents = opts.emitDailyReviewEvents;
+          }
+          if (opts.emitWeeklyReviewEvents === true || opts.emitWeeklyReviewEvents === false) {
+            patchAutonomy.emitWeeklyReviewEvents = opts.emitWeeklyReviewEvents;
           }
           if (opts.pause) {
             patchAutonomy.paused = true;

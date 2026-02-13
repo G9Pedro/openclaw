@@ -26,6 +26,11 @@ export type CronAutonomyConfig = {
   dailyCycleBudget?: number;
   maxConsecutiveErrors?: number;
   autoPauseOnBudgetExhausted?: boolean;
+  autoResumeOnNewDayBudgetPause?: boolean;
+  errorPauseMinutes?: number;
+  staleTaskHours?: number;
+  emitDailyReviewEvents?: boolean;
+  emitWeeklyReviewEvents?: boolean;
 };
 
 export type CronPayload =

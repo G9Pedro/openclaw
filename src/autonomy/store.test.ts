@@ -31,7 +31,15 @@ describe("autonomy store", () => {
     expect(state.metrics.consecutiveErrors).toBe(0);
     expect(state.paused).toBe(false);
     expect(state.safety.maxConsecutiveErrors).toBe(5);
+    expect(state.safety.autoResumeOnNewDayBudgetPause).toBe(true);
+    expect(state.safety.errorPauseMinutes).toBe(240);
+    expect(state.safety.staleTaskHours).toBe(24);
+    expect(state.safety.emitDailyReviewEvents).toBe(true);
+    expect(state.safety.emitWeeklyReviewEvents).toBe(true);
     expect(state.budget.cyclesUsed).toBe(0);
+    expect(state.review.lastDailyReviewDayKey).toBeUndefined();
+    expect(state.review.lastWeeklyReviewKey).toBeUndefined();
+    expect(state.taskSignals).toEqual({});
 
     const statePath = store.resolveAutonomyStatePath("ops");
     const raw = await fs.readFile(statePath, "utf-8");
@@ -99,6 +107,16 @@ describe("autonomy store", () => {
     expect(state.metrics.cycles).toBe(1);
     expect(state.metrics.ok).toBe(1);
     expect(state.budget.tokensUsed).toBeGreaterThanOrEqual(15);
+    expect(state.budget.cyclesUsed).toBe(1);
+
+    store.recordAutonomyCycle(state, {
+      ts: 1_000_001,
+      status: "skipped",
+      summary: "paused",
+      processedEvents: 0,
+      durationMs: 0,
+    });
+    expect(state.metrics.skipped).toBe(1);
     expect(state.budget.cyclesUsed).toBe(1);
 
     const workspaceDir = path.join(tmpDir, "workspace");

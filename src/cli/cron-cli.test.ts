@@ -15,6 +15,8 @@ const enqueueAutonomyEvent = vi.fn(async (_params: unknown) => ({
 const loadAutonomyState = vi.fn(async () => ({
   agentId: "ops",
   paused: false,
+  pauseReason: undefined,
+  pausedAt: undefined,
   mission: "test mission",
   goalsFile: "AUTONOMY_GOALS.md",
   tasksFile: "AUTONOMY_TASKS.md",
@@ -22,6 +24,16 @@ const loadAutonomyState = vi.fn(async () => ({
   maxActionsPerRun: 3,
   dedupeWindowMs: 3_600_000,
   maxQueuedEvents: 100,
+  review: {
+    lastDailyReviewDayKey: "2026-02-12",
+    lastWeeklyReviewKey: "2026-W06",
+  },
+  taskSignals: {},
+  dedupe: {},
+  goals: [],
+  tasks: [],
+  recentEvents: [],
+  recentCycles: [],
   budget: {
     dayKey: "2026-02-13",
     cyclesUsed: 2,
@@ -32,6 +44,11 @@ const loadAutonomyState = vi.fn(async () => ({
     dailyTokenBudget: 100_000,
     maxConsecutiveErrors: 5,
     autoPauseOnBudgetExhausted: true,
+    autoResumeOnNewDayBudgetPause: true,
+    errorPauseMinutes: 240,
+    staleTaskHours: 24,
+    emitDailyReviewEvents: true,
+    emitWeeklyReviewEvents: true,
   },
   metrics: {
     cycles: 2,
@@ -441,6 +458,11 @@ describe("cron cli", () => {
           maxActionsPerRun?: number;
           maxConsecutiveErrors?: number;
           autoPauseOnBudgetExhausted?: boolean;
+          autoResumeOnNewDayBudgetPause?: boolean;
+          errorPauseMinutes?: number;
+          staleTaskHours?: number;
+          emitDailyReviewEvents?: boolean;
+          emitWeeklyReviewEvents?: boolean;
         };
       };
       isolation?: { postToMainPrefix?: string };
@@ -457,6 +479,11 @@ describe("cron cli", () => {
     expect(params?.payload?.autonomy?.maxActionsPerRun).toBe(3);
     expect(params?.payload?.autonomy?.maxConsecutiveErrors).toBe(5);
     expect(params?.payload?.autonomy?.autoPauseOnBudgetExhausted).toBe(true);
+    expect(params?.payload?.autonomy?.autoResumeOnNewDayBudgetPause).toBe(true);
+    expect(params?.payload?.autonomy?.errorPauseMinutes).toBe(240);
+    expect(params?.payload?.autonomy?.staleTaskHours).toBe(24);
+    expect(params?.payload?.autonomy?.emitDailyReviewEvents).toBe(true);
+    expect(params?.payload?.autonomy?.emitWeeklyReviewEvents).toBe(true);
     expect(params?.isolation?.postToMainPrefix).toBe("Autonomy");
   });
 
@@ -491,6 +518,13 @@ describe("cron cli", () => {
         "--max-consecutive-errors",
         "9",
         "--no-auto-pause-on-budget",
+        "--no-auto-resume-on-new-day-budget",
+        "--error-pause-minutes",
+        "30",
+        "--stale-task-hours",
+        "48",
+        "--no-emit-daily-review-events",
+        "--no-emit-weekly-review-events",
         "--goals-file",
         "GOALS.md",
         "--tasks-file",
@@ -531,6 +565,11 @@ describe("cron cli", () => {
           dailyCycleBudget?: number;
           maxConsecutiveErrors?: number;
           autoPauseOnBudgetExhausted?: boolean;
+          autoResumeOnNewDayBudgetPause?: boolean;
+          errorPauseMinutes?: number;
+          staleTaskHours?: number;
+          emitDailyReviewEvents?: boolean;
+          emitWeeklyReviewEvents?: boolean;
         };
       };
     };
@@ -555,6 +594,11 @@ describe("cron cli", () => {
     expect(params?.payload?.autonomy?.dailyCycleBudget).toBe(50);
     expect(params?.payload?.autonomy?.maxConsecutiveErrors).toBe(9);
     expect(params?.payload?.autonomy?.autoPauseOnBudgetExhausted).toBe(false);
+    expect(params?.payload?.autonomy?.autoResumeOnNewDayBudgetPause).toBe(false);
+    expect(params?.payload?.autonomy?.errorPauseMinutes).toBe(30);
+    expect(params?.payload?.autonomy?.staleTaskHours).toBe(48);
+    expect(params?.payload?.autonomy?.emitDailyReviewEvents).toBe(false);
+    expect(params?.payload?.autonomy?.emitWeeklyReviewEvents).toBe(false);
   });
 
   it("pauses and resumes autonomous jobs via cron.update", async () => {
@@ -632,6 +676,20 @@ describe("cron cli", () => {
     expect(resetAutonomyRuntime).toHaveBeenCalledWith("ops");
   });
 
+  it("summarizes autonomy health", async () => {
+    loadAutonomyState.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(["cron", "autonomous-health", "--agent", " Ops ", "--json"], {
+      from: "user",
+    });
+    expect(loadAutonomyState).toHaveBeenCalledWith({ agentId: "ops" });
+  });
+
   it("tunes autonomy fields on an existing job", async () => {
     callGatewayFromCli.mockClear();
 
@@ -651,6 +709,12 @@ describe("cron cli", () => {
         "6",
         "--daily-token-budget",
         "200000",
+        "--error-pause-minutes",
+        "45",
+        "--stale-task-hours",
+        "36",
+        "--no-auto-resume-on-new-day-budget",
+        "--no-emit-daily-review-events",
         "--pause",
       ],
       { from: "user" },
@@ -664,6 +728,10 @@ describe("cron cli", () => {
             mission?: string;
             maxActionsPerRun?: number;
             dailyTokenBudget?: number;
+            errorPauseMinutes?: number;
+            staleTaskHours?: number;
+            autoResumeOnNewDayBudgetPause?: boolean;
+            emitDailyReviewEvents?: boolean;
             paused?: boolean;
           };
         };
@@ -673,6 +741,10 @@ describe("cron cli", () => {
     expect(patch?.patch?.payload?.autonomy?.mission).toBe("new mission");
     expect(patch?.patch?.payload?.autonomy?.maxActionsPerRun).toBe(6);
     expect(patch?.patch?.payload?.autonomy?.dailyTokenBudget).toBe(200000);
+    expect(patch?.patch?.payload?.autonomy?.errorPauseMinutes).toBe(45);
+    expect(patch?.patch?.payload?.autonomy?.staleTaskHours).toBe(36);
+    expect(patch?.patch?.payload?.autonomy?.autoResumeOnNewDayBudgetPause).toBe(false);
+    expect(patch?.patch?.payload?.autonomy?.emitDailyReviewEvents).toBe(false);
     expect(patch?.patch?.payload?.autonomy?.paused).toBe(true);
   });
 

@@ -68,6 +68,11 @@ export type AutonomySafetyPolicy = {
   dailyCycleBudget?: number;
   maxConsecutiveErrors: number;
   autoPauseOnBudgetExhausted: boolean;
+  autoResumeOnNewDayBudgetPause: boolean;
+  errorPauseMinutes: number;
+  staleTaskHours: number;
+  emitDailyReviewEvents: boolean;
+  emitWeeklyReviewEvents: boolean;
 };
 
 export type AutonomyBudgetUsage = {
@@ -76,11 +81,20 @@ export type AutonomyBudgetUsage = {
   tokensUsed: number;
 };
 
+export type AutonomyPauseReason = "manual" | "budget" | "errors";
+
+export type AutonomyReviewState = {
+  lastDailyReviewDayKey?: string;
+  lastWeeklyReviewKey?: string;
+};
+
 export type AutonomyState = {
   version: 1;
   agentId: string;
   mission: string;
   paused: boolean;
+  pauseReason?: AutonomyPauseReason;
+  pausedAt?: number;
   goalsFile: string;
   tasksFile: string;
   logFile: string;
@@ -89,6 +103,8 @@ export type AutonomyState = {
   maxQueuedEvents: number;
   safety: AutonomySafetyPolicy;
   budget: AutonomyBudgetUsage;
+  review: AutonomyReviewState;
+  taskSignals: Record<string, string>;
   dedupe: Record<string, number>;
   goals: AutonomyGoal[];
   tasks: AutonomyTask[];

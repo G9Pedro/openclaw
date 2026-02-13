@@ -18,12 +18,16 @@ const MAX_RECENT_CYCLES = 50;
 const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
 const DEFAULT_MAX_QUEUED_EVENTS = 100;
 const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
+const DEFAULT_ERROR_PAUSE_MINUTES = 240;
+const DEFAULT_STALE_TASK_HOURS = 24;
 
 const writesByPath = new Map<string, Promise<void>>();
 
 type PartialAutonomyState = {
   mission?: AutonomyState["mission"];
   paused?: AutonomyState["paused"];
+  pauseReason?: AutonomyState["pauseReason"];
+  pausedAt?: AutonomyState["pausedAt"];
   goalsFile?: AutonomyState["goalsFile"];
   tasksFile?: AutonomyState["tasksFile"];
   logFile?: AutonomyState["logFile"];
@@ -32,6 +36,8 @@ type PartialAutonomyState = {
   maxQueuedEvents?: AutonomyState["maxQueuedEvents"];
   safety?: Partial<AutonomyState["safety"]>;
   budget?: Partial<AutonomyState["budget"]>;
+  review?: Partial<AutonomyState["review"]>;
+  taskSignals?: AutonomyState["taskSignals"];
 };
 
 function normalizeOptionalString(value: unknown) {
@@ -51,6 +57,16 @@ function clampInt(value: number | undefined, min: number, max: number, fallback:
 
 function resolveDayKey(nowMs: number) {
   return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+export function resolveIsoWeekKey(nowMs: number) {
+  const date = new Date(nowMs);
+  const utc = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = utc.getUTCDay() || 7;
+  utc.setUTCDate(utc.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1));
+  const week = Math.ceil(((utc.getTime() - yearStart.getTime()) / 86_400_000 + 1) / 7);
+  return `${utc.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
 }
 
 function resolveEventDedupeKey(event: AutonomyEvent) {
@@ -97,6 +113,8 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
       normalizeOptionalString(defaults?.mission) ??
       "Continuously pursue useful long-term goals using external signals and delegated work.",
     paused: defaults?.paused === true,
+    pauseReason: defaults?.pauseReason,
+    pausedAt: defaults?.pausedAt,
     goalsFile: normalizeOptionalString(defaults?.goalsFile) ?? "AUTONOMY_GOALS.md",
     tasksFile: normalizeOptionalString(defaults?.tasksFile) ?? "AUTONOMY_TASKS.md",
     logFile: normalizeOptionalString(defaults?.logFile) ?? "AUTONOMY_LOG.md",
@@ -119,12 +137,32 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
         DEFAULT_MAX_CONSECUTIVE_ERRORS,
       ),
       autoPauseOnBudgetExhausted: defaults?.safety?.autoPauseOnBudgetExhausted !== false,
+      autoResumeOnNewDayBudgetPause: defaults?.safety?.autoResumeOnNewDayBudgetPause !== false,
+      errorPauseMinutes: clampInt(
+        defaults?.safety?.errorPauseMinutes,
+        1,
+        24 * 60,
+        DEFAULT_ERROR_PAUSE_MINUTES,
+      ),
+      staleTaskHours: clampInt(
+        defaults?.safety?.staleTaskHours,
+        1,
+        24 * 30,
+        DEFAULT_STALE_TASK_HOURS,
+      ),
+      emitDailyReviewEvents: defaults?.safety?.emitDailyReviewEvents !== false,
+      emitWeeklyReviewEvents: defaults?.safety?.emitWeeklyReviewEvents !== false,
     },
     budget: {
       dayKey,
       cyclesUsed: 0,
       tokensUsed: 0,
     },
+    review: {
+      lastDailyReviewDayKey: defaults?.review?.lastDailyReviewDayKey,
+      lastWeeklyReviewKey: defaults?.review?.lastWeeklyReviewKey,
+    },
+    taskSignals: defaults?.taskSignals ? { ...defaults.taskSignals } : {},
     dedupe: {},
     goals: [],
     tasks: [],
@@ -170,11 +208,28 @@ export async function resetAutonomyRuntime(agentId: string) {
 export function refreshAutonomyBudgetWindow(state: AutonomyState, nowMs = Date.now()) {
   const dayKey = resolveDayKey(nowMs);
   if (state.budget.dayKey === dayKey) {
-    return;
+    return false;
   }
   state.budget.dayKey = dayKey;
   state.budget.cyclesUsed = 0;
   state.budget.tokensUsed = 0;
+  return true;
+}
+
+export function applyAutonomyPause(
+  state: AutonomyState,
+  reason: NonNullable<AutonomyState["pauseReason"]>,
+  nowMs = Date.now(),
+) {
+  state.paused = true;
+  state.pauseReason = reason;
+  state.pausedAt = nowMs;
+}
+
+export function clearAutonomyPause(state: AutonomyState) {
+  state.paused = false;
+  state.pauseReason = undefined;
+  state.pausedAt = undefined;
 }
 
 export async function loadAutonomyState(params: {
@@ -198,6 +253,16 @@ export async function loadAutonomyState(params: {
   if (parsed && typeof parsed === "object") {
     state.mission = normalizeOptionalString(parsed.mission) ?? state.mission;
     state.paused = parsed.paused === true;
+    const pauseReasonRaw = (parsed as { pauseReason?: unknown }).pauseReason;
+    state.pauseReason =
+      pauseReasonRaw === "manual" || pauseReasonRaw === "budget" || pauseReasonRaw === "errors"
+        ? pauseReasonRaw
+        : undefined;
+    state.pausedAt =
+      typeof (parsed as { pausedAt?: unknown }).pausedAt === "number" &&
+      Number.isFinite((parsed as { pausedAt?: unknown }).pausedAt)
+        ? Math.max(0, Math.floor((parsed as { pausedAt?: number }).pausedAt as number))
+        : undefined;
     state.goalsFile = normalizeOptionalString(parsed.goalsFile) ?? state.goalsFile;
     state.tasksFile = normalizeOptionalString(parsed.tasksFile) ?? state.tasksFile;
     state.logFile = normalizeOptionalString(parsed.logFile) ?? state.logFile;
@@ -216,6 +281,16 @@ export async function loadAutonomyState(params: {
         .maxConsecutiveErrors;
       const autoPauseOnBudgetExhausted = (parsed.safety as { autoPauseOnBudgetExhausted?: unknown })
         .autoPauseOnBudgetExhausted;
+      const autoResumeOnNewDayBudgetPause = (
+        parsed.safety as { autoResumeOnNewDayBudgetPause?: unknown }
+      ).autoResumeOnNewDayBudgetPause;
+      const errorPauseMinutes = (parsed.safety as { errorPauseMinutes?: unknown })
+        .errorPauseMinutes;
+      const staleTaskHours = (parsed.safety as { staleTaskHours?: unknown }).staleTaskHours;
+      const emitDailyReviewEvents = (parsed.safety as { emitDailyReviewEvents?: unknown })
+        .emitDailyReviewEvents;
+      const emitWeeklyReviewEvents = (parsed.safety as { emitWeeklyReviewEvents?: unknown })
+        .emitWeeklyReviewEvents;
       state.safety.dailyTokenBudget =
         typeof dailyTokenBudget === "number" && Number.isFinite(dailyTokenBudget)
           ? Math.max(1, Math.floor(dailyTokenBudget))
@@ -231,6 +306,21 @@ export async function loadAutonomyState(params: {
         state.safety.maxConsecutiveErrors,
       );
       state.safety.autoPauseOnBudgetExhausted = autoPauseOnBudgetExhausted !== false;
+      state.safety.autoResumeOnNewDayBudgetPause = autoResumeOnNewDayBudgetPause !== false;
+      state.safety.errorPauseMinutes = clampInt(
+        typeof errorPauseMinutes === "number" ? errorPauseMinutes : undefined,
+        1,
+        24 * 60,
+        state.safety.errorPauseMinutes,
+      );
+      state.safety.staleTaskHours = clampInt(
+        typeof staleTaskHours === "number" ? staleTaskHours : undefined,
+        1,
+        24 * 30,
+        state.safety.staleTaskHours,
+      );
+      state.safety.emitDailyReviewEvents = emitDailyReviewEvents !== false;
+      state.safety.emitWeeklyReviewEvents = emitWeeklyReviewEvents !== false;
     }
     if (parsed.budget && typeof parsed.budget === "object") {
       const dayKey = (parsed.budget as { dayKey?: unknown }).dayKey;
@@ -248,6 +338,22 @@ export async function loadAutonomyState(params: {
           : 0;
     }
     state.dedupe = parsed.dedupe && typeof parsed.dedupe === "object" ? { ...parsed.dedupe } : {};
+    if (parsed.review && typeof parsed.review === "object") {
+      const lastDailyReviewDayKey = (parsed.review as { lastDailyReviewDayKey?: unknown })
+        .lastDailyReviewDayKey;
+      const lastWeeklyReviewKey = (parsed.review as { lastWeeklyReviewKey?: unknown })
+        .lastWeeklyReviewKey;
+      state.review.lastDailyReviewDayKey =
+        typeof lastDailyReviewDayKey === "string" && lastDailyReviewDayKey.trim()
+          ? lastDailyReviewDayKey
+          : undefined;
+      state.review.lastWeeklyReviewKey =
+        typeof lastWeeklyReviewKey === "string" && lastWeeklyReviewKey.trim()
+          ? lastWeeklyReviewKey
+          : undefined;
+    }
+    state.taskSignals =
+      parsed.taskSignals && typeof parsed.taskSignals === "object" ? { ...parsed.taskSignals } : {};
     state.goals = Array.isArray(parsed.goals) ? parsed.goals : [];
     state.tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
     state.recentEvents = Array.isArray(parsed.recentEvents)
@@ -275,6 +381,12 @@ export async function loadAutonomyState(params: {
               typeof parsed.metrics.lastError === "string" ? parsed.metrics.lastError : undefined,
           }
         : state.metrics;
+  }
+  if (!state.paused) {
+    state.pauseReason = undefined;
+    state.pausedAt = undefined;
+  } else if (!state.pauseReason) {
+    state.pauseReason = "manual";
   }
   refreshAutonomyBudgetWindow(state);
   return state;
@@ -389,9 +501,11 @@ export function recordAutonomyCycle(state: AutonomyState, cycle: AutonomyCycleRe
   refreshAutonomyBudgetWindow(state, cycle.ts);
   state.metrics.cycles += 1;
   state.metrics.lastCycleAt = cycle.ts;
-  state.budget.cyclesUsed += 1;
-  if (cycle.tokenUsage && Number.isFinite(cycle.tokenUsage.total)) {
-    state.budget.tokensUsed += Math.max(0, Math.floor(cycle.tokenUsage.total));
+  if (cycle.status !== "skipped") {
+    state.budget.cyclesUsed += 1;
+    if (cycle.tokenUsage && Number.isFinite(cycle.tokenUsage.total)) {
+      state.budget.tokensUsed += Math.max(0, Math.floor(cycle.tokenUsage.total));
+    }
   }
   if (cycle.status === "ok") {
     state.metrics.ok += 1;

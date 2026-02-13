@@ -245,6 +245,21 @@ function mergeAutonomyConfig(
   if (typeof patch.autoPauseOnBudgetExhausted === "boolean") {
     next.autoPauseOnBudgetExhausted = patch.autoPauseOnBudgetExhausted;
   }
+  if (typeof patch.autoResumeOnNewDayBudgetPause === "boolean") {
+    next.autoResumeOnNewDayBudgetPause = patch.autoResumeOnNewDayBudgetPause;
+  }
+  if (typeof patch.errorPauseMinutes === "number" && Number.isFinite(patch.errorPauseMinutes)) {
+    next.errorPauseMinutes = patch.errorPauseMinutes;
+  }
+  if (typeof patch.staleTaskHours === "number" && Number.isFinite(patch.staleTaskHours)) {
+    next.staleTaskHours = patch.staleTaskHours;
+  }
+  if (typeof patch.emitDailyReviewEvents === "boolean") {
+    next.emitDailyReviewEvents = patch.emitDailyReviewEvents;
+  }
+  if (typeof patch.emitWeeklyReviewEvents === "boolean") {
+    next.emitWeeklyReviewEvents = patch.emitWeeklyReviewEvents;
+  }
   return next;
 }
 

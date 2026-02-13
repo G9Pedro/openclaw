@@ -82,6 +82,7 @@ describe("autonomy runtime", () => {
         output: 100,
         total: 300,
       },
+      lockToken: prepared.lockToken,
     });
 
     const reloaded = await store.loadAutonomyState({ agentId: "ops" });
@@ -114,6 +115,7 @@ describe("autonomy runtime", () => {
     if ("skipped" in prepared) {
       expect(prepared.reason).toContain("daily cycle budget exhausted");
       expect(prepared.state.paused).toBe(true);
+      expect(prepared.state.pauseReason).toBe("budget");
     }
   });
 
@@ -140,6 +142,7 @@ describe("autonomy runtime", () => {
       events: prepared.events,
       droppedDuplicates: prepared.droppedDuplicates,
       remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
     });
 
     const preparedSecond = await runtime.prepareAutonomyRuntime({
@@ -162,9 +165,188 @@ describe("autonomy runtime", () => {
       events: preparedSecond.events,
       droppedDuplicates: preparedSecond.droppedDuplicates,
       remainingEvents: preparedSecond.remainingEvents,
+      lockToken: preparedSecond.lockToken,
     });
     const reloaded = await store.loadAutonomyState({ agentId: "ops" });
     expect(reloaded.paused).toBe(true);
+    expect(reloaded.pauseReason).toBe("errors");
     expect(reloaded.metrics.consecutiveErrors).toBeGreaterThanOrEqual(2);
+  });
+
+  it("auto-resumes budget pause on new day and injects resume signal", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.paused = true;
+    state.pauseReason = "budget";
+    state.pausedAt = Date.now() - 3_600_000;
+    state.budget.dayKey = "2000-01-01";
+    state.budget.cyclesUsed = 99;
+    state.budget.tokensUsed = 99_000;
+    await store.saveAutonomyState(state);
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected budget pause to auto-resume");
+    }
+    expect(prepared.state.paused).toBe(false);
+    expect(prepared.events.some((event) => event.type === "autonomy.resume")).toBe(true);
+    expect(prepared.state.budget.cyclesUsed).toBe(0);
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      summary: "resume-ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
+
+  it("emits daily/weekly review only once per period", async () => {
+    const runtime = await import("./runtime.js");
+
+    const first = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in first) {
+      throw new Error("expected first run to execute");
+    }
+    expect(first.events.some((event) => event.type === "autonomy.review.daily")).toBe(true);
+    expect(first.events.some((event) => event.type === "autonomy.review.weekly")).toBe(true);
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: first.state,
+      cycleStartedAt: first.cycleStartedAt,
+      status: "ok",
+      summary: "first",
+      events: first.events,
+      droppedDuplicates: first.droppedDuplicates,
+      remainingEvents: first.remainingEvents,
+      lockToken: first.lockToken,
+    });
+
+    const second = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in second) {
+      throw new Error("expected second run to execute");
+    }
+    expect(second.events.some((event) => event.type === "autonomy.review.daily")).toBe(false);
+    expect(second.events.some((event) => event.type === "autonomy.review.weekly")).toBe(false);
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: second.state,
+      cycleStartedAt: second.cycleStartedAt,
+      status: "ok",
+      summary: "second",
+      events: second.events,
+      droppedDuplicates: second.droppedDuplicates,
+      remainingEvents: second.remainingEvents,
+      lockToken: second.lockToken,
+    });
+  });
+
+  it("emits stale task signals and dedupes them per day", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.tasks = [
+      {
+        id: "t-1",
+        title: "Long blocked task",
+        status: "blocked",
+        priority: "high",
+        dependencies: [],
+        owner: "autonomy",
+        createdAt: Date.now() - 72 * 3_600_000,
+        updatedAt: Date.now() - 48 * 3_600_000,
+      },
+    ];
+    await store.saveAutonomyState(state);
+
+    const first = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true, staleTaskHours: 24 },
+    });
+    if ("skipped" in first) {
+      throw new Error("expected stale task run to execute");
+    }
+    expect(first.events.some((event) => event.type === "autonomy.task.stale.blocked")).toBe(true);
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: first.state,
+      cycleStartedAt: first.cycleStartedAt,
+      status: "ok",
+      events: first.events,
+      droppedDuplicates: first.droppedDuplicates,
+      remainingEvents: first.remainingEvents,
+      lockToken: first.lockToken,
+    });
+
+    const second = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true, staleTaskHours: 24 },
+    });
+    if ("skipped" in second) {
+      throw new Error("expected second stale run to execute");
+    }
+    expect(second.events.some((event) => event.type === "autonomy.task.stale.blocked")).toBe(false);
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: second.state,
+      cycleStartedAt: second.cycleStartedAt,
+      status: "ok",
+      events: second.events,
+      droppedDuplicates: second.droppedDuplicates,
+      remainingEvents: second.remainingEvents,
+      lockToken: second.lockToken,
+    });
+  });
+
+  it("prevents overlapping runs with per-agent runtime lock", async () => {
+    const runtime = await import("./runtime.js");
+    const first = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in first) {
+      throw new Error("expected first lock attempt to succeed");
+    }
+
+    const second = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    expect("skipped" in second && second.skipped).toBe(true);
+    if ("skipped" in second) {
+      expect(second.reason).toContain("already in progress");
+    }
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: first.state,
+      cycleStartedAt: first.cycleStartedAt,
+      status: "ok",
+      events: first.events,
+      droppedDuplicates: first.droppedDuplicates,
+      remainingEvents: first.remainingEvents,
+      lockToken: first.lockToken,
+    });
   });
 });

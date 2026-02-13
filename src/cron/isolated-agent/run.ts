@@ -40,7 +40,11 @@ import {
   normalizeVerboseLevel,
   supportsXHighThinking,
 } from "../../auto-reply/thinking.js";
-import { finalizeAutonomyRuntime, prepareAutonomyRuntime } from "../../autonomy/runtime.js";
+import {
+  finalizeAutonomyRuntime,
+  prepareAutonomyRuntime,
+  releaseAutonomyRunLock,
+} from "../../autonomy/runtime.js";
 import { createOutboundSendDeps, type CliDeps } from "../../cli/outbound-send-deps.js";
 import { resolveSessionTranscriptPath, updateSessionStore } from "../../config/sessions.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
@@ -261,6 +265,7 @@ export async function runCronIsolatedAgentTurn(params: {
     });
     return { status: "skipped", summary: autonomyRuntime.reason };
   }
+  let autonomyCycleClosed = false;
   const completeAutonomyCycle = async (params: {
     status: "ok" | "error" | "skipped";
     summary?: string;
@@ -287,286 +292,295 @@ export async function runCronIsolatedAgentTurn(params: {
       droppedDuplicates: autonomyRuntime.droppedDuplicates,
       remainingEvents: autonomyRuntime.remainingEvents,
       usage: params.usage,
+      lockToken: autonomyRuntime.lockToken,
     });
+    autonomyCycleClosed = true;
   };
 
-  const resolvedDelivery = await resolveDeliveryTarget(cfgWithAgentDefaults, agentId, {
-    channel: agentPayload?.channel ?? "last",
-    to: agentPayload?.to,
-  });
-
-  const userTimezone = resolveUserTimezone(params.cfg.agents?.defaults?.userTimezone);
-  const userTimeFormat = resolveUserTimeFormat(params.cfg.agents?.defaults?.timeFormat);
-  const formattedTime =
-    formatUserTime(new Date(now), userTimezone, userTimeFormat) ?? new Date(now).toISOString();
-  const timeLine = `Current time: ${formattedTime} (${userTimezone})`;
-  const autonomyBody =
-    autonomyRuntime && !("skipped" in autonomyRuntime)
-      ? [
-          `[cron:${params.job.id} ${params.job.name}] autonomous cycle`,
-          "",
-          autonomyRuntime.prompt,
-          params.message.trim()
-            ? `\n\nOperator objective for this job:\n${params.message.trim()}`
-            : "",
-        ]
-          .join("\n")
-          .trim()
-      : null;
-  const base =
-    autonomyBody ?? `[cron:${params.job.id} ${params.job.name}] ${params.message}`.trim();
-
-  // SECURITY: Wrap external hook content with security boundaries to prevent prompt injection
-  // unless explicitly allowed via a dangerous config override.
-  const isExternalHook = isExternalHookSession(baseSessionKey);
-  const allowUnsafeExternalContent =
-    agentPayload?.allowUnsafeExternalContent === true ||
-    (isGmailHook && params.cfg.hooks?.gmail?.allowUnsafeExternalContent === true);
-  const shouldWrapExternal = isExternalHook && !allowUnsafeExternalContent;
-  let commandBody: string;
-
-  if (isExternalHook) {
-    // Log suspicious patterns for security monitoring
-    const suspiciousPatterns = detectSuspiciousPatterns(params.message);
-    if (suspiciousPatterns.length > 0) {
-      logWarn(
-        `[security] Suspicious patterns detected in external hook content ` +
-          `(session=${baseSessionKey}, patterns=${suspiciousPatterns.length}): ` +
-          `${suspiciousPatterns.slice(0, 3).join(", ")}`,
-      );
-    }
-  }
-
-  if (shouldWrapExternal) {
-    // Wrap external content with security boundaries
-    const hookType = getHookType(baseSessionKey);
-    const safeContent = buildSafeExternalPrompt({
-      content: params.message,
-      source: hookType,
-      jobName: params.job.name,
-      jobId: params.job.id,
-      timestamp: formattedTime,
+  try {
+    const resolvedDelivery = await resolveDeliveryTarget(cfgWithAgentDefaults, agentId, {
+      channel: agentPayload?.channel ?? "last",
+      to: agentPayload?.to,
     });
 
-    commandBody = `${safeContent}\n\n${timeLine}`.trim();
-  } else {
-    // Internal/trusted source - use original format
-    commandBody = `${base}\n${timeLine}`.trim();
-  }
+    const userTimezone = resolveUserTimezone(params.cfg.agents?.defaults?.userTimezone);
+    const userTimeFormat = resolveUserTimeFormat(params.cfg.agents?.defaults?.timeFormat);
+    const formattedTime =
+      formatUserTime(new Date(now), userTimezone, userTimeFormat) ?? new Date(now).toISOString();
+    const timeLine = `Current time: ${formattedTime} (${userTimezone})`;
+    const autonomyBody =
+      autonomyRuntime && !("skipped" in autonomyRuntime)
+        ? [
+            `[cron:${params.job.id} ${params.job.name}] autonomous cycle`,
+            "",
+            autonomyRuntime.prompt,
+            params.message.trim()
+              ? `\n\nOperator objective for this job:\n${params.message.trim()}`
+              : "",
+          ]
+            .join("\n")
+            .trim()
+        : null;
+    const base =
+      autonomyBody ?? `[cron:${params.job.id} ${params.job.name}] ${params.message}`.trim();
 
-  const existingSnapshot = cronSession.sessionEntry.skillsSnapshot;
-  const skillsSnapshotVersion = getSkillsSnapshotVersion(workspaceDir);
-  const needsSkillsSnapshot =
-    !existingSnapshot || existingSnapshot.version !== skillsSnapshotVersion;
-  const skillsSnapshot = needsSkillsSnapshot
-    ? buildWorkspaceSkillSnapshot(workspaceDir, {
-        config: cfgWithAgentDefaults,
-        eligibility: { remote: getRemoteSkillEligibility() },
-        snapshotVersion: skillsSnapshotVersion,
-      })
-    : cronSession.sessionEntry.skillsSnapshot;
-  if (needsSkillsSnapshot && skillsSnapshot) {
-    cronSession.sessionEntry = {
-      ...cronSession.sessionEntry,
-      updatedAt: Date.now(),
-      skillsSnapshot,
-    };
+    // SECURITY: Wrap external hook content with security boundaries to prevent prompt injection
+    // unless explicitly allowed via a dangerous config override.
+    const isExternalHook = isExternalHookSession(baseSessionKey);
+    const allowUnsafeExternalContent =
+      agentPayload?.allowUnsafeExternalContent === true ||
+      (isGmailHook && params.cfg.hooks?.gmail?.allowUnsafeExternalContent === true);
+    const shouldWrapExternal = isExternalHook && !allowUnsafeExternalContent;
+    let commandBody: string;
+
+    if (isExternalHook) {
+      // Log suspicious patterns for security monitoring
+      const suspiciousPatterns = detectSuspiciousPatterns(params.message);
+      if (suspiciousPatterns.length > 0) {
+        logWarn(
+          `[security] Suspicious patterns detected in external hook content ` +
+            `(session=${baseSessionKey}, patterns=${suspiciousPatterns.length}): ` +
+            `${suspiciousPatterns.slice(0, 3).join(", ")}`,
+        );
+      }
+    }
+
+    if (shouldWrapExternal) {
+      // Wrap external content with security boundaries
+      const hookType = getHookType(baseSessionKey);
+      const safeContent = buildSafeExternalPrompt({
+        content: params.message,
+        source: hookType,
+        jobName: params.job.name,
+        jobId: params.job.id,
+        timestamp: formattedTime,
+      });
+
+      commandBody = `${safeContent}\n\n${timeLine}`.trim();
+    } else {
+      // Internal/trusted source - use original format
+      commandBody = `${base}\n${timeLine}`.trim();
+    }
+
+    const existingSnapshot = cronSession.sessionEntry.skillsSnapshot;
+    const skillsSnapshotVersion = getSkillsSnapshotVersion(workspaceDir);
+    const needsSkillsSnapshot =
+      !existingSnapshot || existingSnapshot.version !== skillsSnapshotVersion;
+    const skillsSnapshot = needsSkillsSnapshot
+      ? buildWorkspaceSkillSnapshot(workspaceDir, {
+          config: cfgWithAgentDefaults,
+          eligibility: { remote: getRemoteSkillEligibility() },
+          snapshotVersion: skillsSnapshotVersion,
+        })
+      : cronSession.sessionEntry.skillsSnapshot;
+    if (needsSkillsSnapshot && skillsSnapshot) {
+      cronSession.sessionEntry = {
+        ...cronSession.sessionEntry,
+        updatedAt: Date.now(),
+        skillsSnapshot,
+      };
+      cronSession.store[agentSessionKey] = cronSession.sessionEntry;
+      await updateSessionStore(cronSession.storePath, (store) => {
+        store[agentSessionKey] = cronSession.sessionEntry;
+      });
+    }
+
+    // Persist systemSent before the run, mirroring the inbound auto-reply behavior.
+    cronSession.sessionEntry.systemSent = true;
     cronSession.store[agentSessionKey] = cronSession.sessionEntry;
     await updateSessionStore(cronSession.storePath, (store) => {
       store[agentSessionKey] = cronSession.sessionEntry;
     });
-  }
 
-  // Persist systemSent before the run, mirroring the inbound auto-reply behavior.
-  cronSession.sessionEntry.systemSent = true;
-  cronSession.store[agentSessionKey] = cronSession.sessionEntry;
-  await updateSessionStore(cronSession.storePath, (store) => {
-    store[agentSessionKey] = cronSession.sessionEntry;
-  });
-
-  let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
-  let fallbackProvider = provider;
-  let fallbackModel = model;
-  try {
-    const sessionFile = resolveSessionTranscriptPath(cronSession.sessionEntry.sessionId, agentId);
-    const resolvedVerboseLevel =
-      normalizeVerboseLevel(cronSession.sessionEntry.verboseLevel) ??
-      normalizeVerboseLevel(agentCfg?.verboseDefault) ??
-      "off";
-    registerAgentRunContext(cronSession.sessionEntry.sessionId, {
-      sessionKey: agentSessionKey,
-      verboseLevel: resolvedVerboseLevel,
-    });
-    const messageChannel = resolvedDelivery.channel;
-    const fallbackResult = await runWithModelFallback({
-      cfg: cfgWithAgentDefaults,
-      provider,
-      model,
-      agentDir,
-      fallbacksOverride: resolveAgentModelFallbacksOverride(params.cfg, agentId),
-      run: (providerOverride, modelOverride) => {
-        if (isCliProvider(providerOverride, cfgWithAgentDefaults)) {
-          const cliSessionId = getCliSessionId(cronSession.sessionEntry, providerOverride);
-          return runCliAgent({
+    let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+    let fallbackProvider = provider;
+    let fallbackModel = model;
+    try {
+      const sessionFile = resolveSessionTranscriptPath(cronSession.sessionEntry.sessionId, agentId);
+      const resolvedVerboseLevel =
+        normalizeVerboseLevel(cronSession.sessionEntry.verboseLevel) ??
+        normalizeVerboseLevel(agentCfg?.verboseDefault) ??
+        "off";
+      registerAgentRunContext(cronSession.sessionEntry.sessionId, {
+        sessionKey: agentSessionKey,
+        verboseLevel: resolvedVerboseLevel,
+      });
+      const messageChannel = resolvedDelivery.channel;
+      const fallbackResult = await runWithModelFallback({
+        cfg: cfgWithAgentDefaults,
+        provider,
+        model,
+        agentDir,
+        fallbacksOverride: resolveAgentModelFallbacksOverride(params.cfg, agentId),
+        run: (providerOverride, modelOverride) => {
+          if (isCliProvider(providerOverride, cfgWithAgentDefaults)) {
+            const cliSessionId = getCliSessionId(cronSession.sessionEntry, providerOverride);
+            return runCliAgent({
+              sessionId: cronSession.sessionEntry.sessionId,
+              sessionKey: agentSessionKey,
+              sessionFile,
+              workspaceDir,
+              config: cfgWithAgentDefaults,
+              prompt: commandBody,
+              provider: providerOverride,
+              model: modelOverride,
+              thinkLevel,
+              timeoutMs,
+              runId: cronSession.sessionEntry.sessionId,
+              cliSessionId,
+            });
+          }
+          return runEmbeddedPiAgent({
             sessionId: cronSession.sessionEntry.sessionId,
             sessionKey: agentSessionKey,
+            messageChannel,
+            agentAccountId: resolvedDelivery.accountId,
             sessionFile,
             workspaceDir,
             config: cfgWithAgentDefaults,
+            skillsSnapshot,
             prompt: commandBody,
+            lane: params.lane ?? "cron",
             provider: providerOverride,
             model: modelOverride,
             thinkLevel,
+            verboseLevel: resolvedVerboseLevel,
             timeoutMs,
             runId: cronSession.sessionEntry.sessionId,
-            cliSessionId,
           });
+        },
+      });
+      runResult = fallbackResult.result;
+      fallbackProvider = fallbackResult.provider;
+      fallbackModel = fallbackResult.model;
+    } catch (err) {
+      const error = String(err);
+      await completeAutonomyCycle({
+        status: "error",
+        error,
+      });
+      return { status: "error", error };
+    }
+
+    const payloads = runResult.payloads ?? [];
+
+    const cycleUsage = runResult.meta.agentMeta?.usage;
+
+    // Update token+model fields in the session store.
+    {
+      const modelUsed = runResult.meta.agentMeta?.model ?? fallbackModel ?? model;
+      const providerUsed = runResult.meta.agentMeta?.provider ?? fallbackProvider ?? provider;
+      const contextTokens =
+        agentCfg?.contextTokens ?? lookupContextTokens(modelUsed) ?? DEFAULT_CONTEXT_TOKENS;
+
+      cronSession.sessionEntry.modelProvider = providerUsed;
+      cronSession.sessionEntry.model = modelUsed;
+      cronSession.sessionEntry.contextTokens = contextTokens;
+      if (isCliProvider(providerUsed, cfgWithAgentDefaults)) {
+        const cliSessionId = runResult.meta.agentMeta?.sessionId?.trim();
+        if (cliSessionId) {
+          setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
         }
-        return runEmbeddedPiAgent({
-          sessionId: cronSession.sessionEntry.sessionId,
-          sessionKey: agentSessionKey,
-          messageChannel,
-          agentAccountId: resolvedDelivery.accountId,
-          sessionFile,
-          workspaceDir,
-          config: cfgWithAgentDefaults,
-          skillsSnapshot,
-          prompt: commandBody,
-          lane: params.lane ?? "cron",
-          provider: providerOverride,
-          model: modelOverride,
-          thinkLevel,
-          verboseLevel: resolvedVerboseLevel,
-          timeoutMs,
-          runId: cronSession.sessionEntry.sessionId,
-        });
-      },
-    });
-    runResult = fallbackResult.result;
-    fallbackProvider = fallbackResult.provider;
-    fallbackModel = fallbackResult.model;
-  } catch (err) {
-    const error = String(err);
-    await completeAutonomyCycle({
-      status: "error",
-      error,
-    });
-    return { status: "error", error };
-  }
-
-  const payloads = runResult.payloads ?? [];
-
-  const cycleUsage = runResult.meta.agentMeta?.usage;
-
-  // Update token+model fields in the session store.
-  {
-    const modelUsed = runResult.meta.agentMeta?.model ?? fallbackModel ?? model;
-    const providerUsed = runResult.meta.agentMeta?.provider ?? fallbackProvider ?? provider;
-    const contextTokens =
-      agentCfg?.contextTokens ?? lookupContextTokens(modelUsed) ?? DEFAULT_CONTEXT_TOKENS;
-
-    cronSession.sessionEntry.modelProvider = providerUsed;
-    cronSession.sessionEntry.model = modelUsed;
-    cronSession.sessionEntry.contextTokens = contextTokens;
-    if (isCliProvider(providerUsed, cfgWithAgentDefaults)) {
-      const cliSessionId = runResult.meta.agentMeta?.sessionId?.trim();
-      if (cliSessionId) {
-        setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
       }
+      if (hasNonzeroUsage(cycleUsage)) {
+        const input = cycleUsage.input ?? 0;
+        const output = cycleUsage.output ?? 0;
+        const promptTokens = input + (cycleUsage.cacheRead ?? 0) + (cycleUsage.cacheWrite ?? 0);
+        cronSession.sessionEntry.inputTokens = input;
+        cronSession.sessionEntry.outputTokens = output;
+        cronSession.sessionEntry.totalTokens =
+          promptTokens > 0 ? promptTokens : (cycleUsage.total ?? input);
+      }
+      cronSession.store[agentSessionKey] = cronSession.sessionEntry;
+      await updateSessionStore(cronSession.storePath, (store) => {
+        store[agentSessionKey] = cronSession.sessionEntry;
+      });
     }
-    if (hasNonzeroUsage(cycleUsage)) {
-      const input = cycleUsage.input ?? 0;
-      const output = cycleUsage.output ?? 0;
-      const promptTokens = input + (cycleUsage.cacheRead ?? 0) + (cycleUsage.cacheWrite ?? 0);
-      cronSession.sessionEntry.inputTokens = input;
-      cronSession.sessionEntry.outputTokens = output;
-      cronSession.sessionEntry.totalTokens =
-        promptTokens > 0 ? promptTokens : (cycleUsage.total ?? input);
-    }
-    cronSession.store[agentSessionKey] = cronSession.sessionEntry;
-    await updateSessionStore(cronSession.storePath, (store) => {
-      store[agentSessionKey] = cronSession.sessionEntry;
-    });
-  }
-  const firstText = payloads[0]?.text ?? "";
-  const summary = pickSummaryFromPayloads(payloads) ?? pickSummaryFromOutput(firstText);
-  const outputText = pickLastNonEmptyTextFromPayloads(payloads);
+    const firstText = payloads[0]?.text ?? "";
+    const summary = pickSummaryFromPayloads(payloads) ?? pickSummaryFromOutput(firstText);
+    const outputText = pickLastNonEmptyTextFromPayloads(payloads);
 
-  // Skip delivery for heartbeat-only responses (HEARTBEAT_OK with no real content).
-  const ackMaxChars = resolveHeartbeatAckMaxChars(agentCfg);
-  const skipHeartbeatDelivery = deliveryRequested && isHeartbeatOnlyResponse(payloads, ackMaxChars);
-  const skipMessagingToolDelivery =
-    deliveryRequested &&
-    deliveryMode === "auto" &&
-    runResult.didSendViaMessagingTool === true &&
-    (runResult.messagingToolSentTargets ?? []).some((target) =>
-      matchesMessagingToolDeliveryTarget(target, {
-        channel: resolvedDelivery.channel,
-        to: resolvedDelivery.to,
-        accountId: resolvedDelivery.accountId,
-      }),
-    );
+    // Skip delivery for heartbeat-only responses (HEARTBEAT_OK with no real content).
+    const ackMaxChars = resolveHeartbeatAckMaxChars(agentCfg);
+    const skipHeartbeatDelivery =
+      deliveryRequested && isHeartbeatOnlyResponse(payloads, ackMaxChars);
+    const skipMessagingToolDelivery =
+      deliveryRequested &&
+      deliveryMode === "auto" &&
+      runResult.didSendViaMessagingTool === true &&
+      (runResult.messagingToolSentTargets ?? []).some((target) =>
+        matchesMessagingToolDeliveryTarget(target, {
+          channel: resolvedDelivery.channel,
+          to: resolvedDelivery.to,
+          accountId: resolvedDelivery.accountId,
+        }),
+      );
 
-  if (deliveryRequested && !skipHeartbeatDelivery && !skipMessagingToolDelivery) {
-    if (!resolvedDelivery.to) {
-      const reason =
-        resolvedDelivery.error?.message ?? "Cron delivery requires a recipient (--to).";
-      if (!bestEffortDeliver) {
+    if (deliveryRequested && !skipHeartbeatDelivery && !skipMessagingToolDelivery) {
+      if (!resolvedDelivery.to) {
+        const reason =
+          resolvedDelivery.error?.message ?? "Cron delivery requires a recipient (--to).";
+        if (!bestEffortDeliver) {
+          await completeAutonomyCycle({
+            status: "error",
+            summary,
+            error: reason,
+          });
+          return {
+            status: "error",
+            summary,
+            outputText,
+            error: reason,
+          };
+        }
         await completeAutonomyCycle({
-          status: "error",
-          summary,
-          error: reason,
+          status: "skipped",
+          summary: `Delivery skipped (${reason}).`,
         });
         return {
-          status: "error",
-          summary,
+          status: "skipped",
+          summary: `Delivery skipped (${reason}).`,
           outputText,
-          error: reason,
         };
       }
-      await completeAutonomyCycle({
-        status: "skipped",
-        summary: `Delivery skipped (${reason}).`,
-      });
-      return {
-        status: "skipped",
-        summary: `Delivery skipped (${reason}).`,
-        outputText,
-      };
-    }
-    try {
-      await deliverOutboundPayloads({
-        cfg: cfgWithAgentDefaults,
-        channel: resolvedDelivery.channel,
-        to: resolvedDelivery.to,
-        accountId: resolvedDelivery.accountId,
-        payloads,
-        bestEffort: bestEffortDeliver,
-        deps: createOutboundSendDeps(params.deps),
-      });
-    } catch (err) {
-      if (!bestEffortDeliver) {
-        const error = String(err);
-        await completeAutonomyCycle({
-          status: "error",
-          summary,
-          error,
+      try {
+        await deliverOutboundPayloads({
+          cfg: cfgWithAgentDefaults,
+          channel: resolvedDelivery.channel,
+          to: resolvedDelivery.to,
+          accountId: resolvedDelivery.accountId,
+          payloads,
+          bestEffort: bestEffortDeliver,
+          deps: createOutboundSendDeps(params.deps),
         });
-        return { status: "error", summary, outputText, error };
+      } catch (err) {
+        if (!bestEffortDeliver) {
+          const error = String(err);
+          await completeAutonomyCycle({
+            status: "error",
+            summary,
+            error,
+          });
+          return { status: "error", summary, outputText, error };
+        }
+        await completeAutonomyCycle({
+          status: "ok",
+          summary,
+          usage: cycleUsage,
+        });
+        return { status: "ok", summary, outputText };
       }
-      await completeAutonomyCycle({
-        status: "ok",
-        summary,
-        usage: cycleUsage,
-      });
-      return { status: "ok", summary, outputText };
+    }
+
+    await completeAutonomyCycle({
+      status: "ok",
+      summary,
+      usage: cycleUsage,
+    });
+    return { status: "ok", summary, outputText };
+  } finally {
+    if (autonomyRuntime && !("skipped" in autonomyRuntime) && !autonomyCycleClosed) {
+      releaseAutonomyRunLock(autonomyRuntime.state.agentId, autonomyRuntime.lockToken);
     }
   }
-
-  await completeAutonomyCycle({
-    status: "ok",
-    summary,
-    usage: cycleUsage,
-  });
-  return { status: "ok", summary, outputText };
 }
