@@ -52,7 +52,7 @@ type PartialAutonomyState = {
   taskSignals?: AutonomyState["taskSignals"];
 };
 
-const AUGMENTATION_STAGES: AutonomyState["augmentation"]["stage"][] = [
+const AUGMENTATION_STAGES = new Set<AutonomyState["augmentation"]["stage"]>([
   "discover",
   "design",
   "synthesize",
@@ -62,13 +62,72 @@ const AUGMENTATION_STAGES: AutonomyState["augmentation"]["stage"][] = [
   "observe",
   "learn",
   "retire",
-];
+]);
 
 function isAugmentationStage(value: unknown): value is AutonomyState["augmentation"]["stage"] {
   return (
     typeof value === "string" &&
-    AUGMENTATION_STAGES.includes(value as AutonomyState["augmentation"]["stage"])
+    AUGMENTATION_STAGES.has(value as AutonomyState["augmentation"]["stage"])
   );
+}
+
+function parseGapCategory(
+  value: unknown,
+): AutonomyState["augmentation"]["gaps"][number]["category"] | undefined {
+  return value === "capability" ||
+    value === "quality" ||
+    value === "reliability" ||
+    value === "safety" ||
+    value === "cost" ||
+    value === "latency" ||
+    value === "unknown"
+    ? value
+    : undefined;
+}
+
+function parseGapStatus(
+  value: unknown,
+): AutonomyState["augmentation"]["gaps"][number]["status"] | undefined {
+  return value === "open" || value === "planned" || value === "addressed" || value === "suppressed"
+    ? value
+    : undefined;
+}
+
+function parseAutonomyEventSource(value: unknown): AutonomyEventSource | undefined {
+  return value === "cron" ||
+    value === "webhook" ||
+    value === "email" ||
+    value === "subagent" ||
+    value === "manual"
+    ? value
+    : undefined;
+}
+
+function parseCandidateStatus(
+  value: unknown,
+): AutonomyState["augmentation"]["candidates"][number]["status"] | undefined {
+  return value === "candidate" ||
+    value === "planned" ||
+    value === "verified" ||
+    value === "rejected"
+    ? value
+    : undefined;
+}
+
+function parseExecutionClass(
+  value: unknown,
+): AutonomyState["augmentation"]["candidates"][number]["safety"]["executionClass"] | undefined {
+  return value === "read_only" || value === "reversible_write" || value === "destructive"
+    ? value
+    : undefined;
+}
+
+function parseExperimentStatus(
+  value: unknown,
+): AutonomyState["augmentation"]["activeExperiments"][number]["status"] | undefined {
+  return value === "active" || value === "passed" || value === "failed" || value === "cancelled"
+    ? value
+    : undefined;
 }
 
 function normalizeOptionalString(value: unknown) {
@@ -492,40 +551,12 @@ export async function loadAutonomyState(params: {
             const id = normalizeOptionalString((raw as { id?: unknown }).id);
             const key = normalizeOptionalString((raw as { key?: unknown }).key);
             const title = normalizeOptionalString((raw as { title?: unknown }).title);
-            const category = normalizeOptionalString((raw as { category?: unknown }).category);
-            const status = normalizeOptionalString((raw as { status?: unknown }).status);
-            const lastSource = normalizeOptionalString(
+            const category = parseGapCategory((raw as { category?: unknown }).category);
+            const status = parseGapStatus((raw as { status?: unknown }).status);
+            const lastSource = parseAutonomyEventSource(
               (raw as { lastSource?: unknown }).lastSource,
             );
             if (!id || !key || !title || !category || !status || !lastSource) {
-              return null;
-            }
-            if (
-              category !== "capability" &&
-              category !== "quality" &&
-              category !== "reliability" &&
-              category !== "safety" &&
-              category !== "cost" &&
-              category !== "latency" &&
-              category !== "unknown"
-            ) {
-              return null;
-            }
-            if (
-              status !== "open" &&
-              status !== "planned" &&
-              status !== "addressed" &&
-              status !== "suppressed"
-            ) {
-              return null;
-            }
-            if (
-              lastSource !== "cron" &&
-              lastSource !== "webhook" &&
-              lastSource !== "email" &&
-              lastSource !== "subagent" &&
-              lastSource !== "manual"
-            ) {
               return null;
             }
             const evidence = Array.isArray((raw as { evidence?: unknown }).evidence)
@@ -609,26 +640,14 @@ export async function loadAutonomyState(params: {
             );
             const name = normalizeOptionalString((raw as { name?: unknown }).name);
             const intent = normalizeOptionalString((raw as { intent?: unknown }).intent);
-            const status = normalizeOptionalString((raw as { status?: unknown }).status);
+            const status = parseCandidateStatus((raw as { status?: unknown }).status);
             if (!id || !sourceGapId || !name || !intent || !status) {
               return null;
             }
-            if (
-              status !== "candidate" &&
-              status !== "planned" &&
-              status !== "verified" &&
-              status !== "rejected"
-            ) {
-              return null;
-            }
-            const executionClass = normalizeOptionalString(
+            const executionClass = parseExecutionClass(
               (raw as { safety?: { executionClass?: unknown } }).safety?.executionClass,
             );
-            if (
-              executionClass !== "read_only" &&
-              executionClass !== "reversible_write" &&
-              executionClass !== "destructive"
-            ) {
+            if (!executionClass) {
               return null;
             }
             const constraintsRaw = (raw as { safety?: { constraints?: unknown } }).safety
@@ -704,16 +723,8 @@ export async function loadAutonomyState(params: {
             const candidateId = normalizeOptionalString(
               (raw as { candidateId?: unknown }).candidateId,
             );
-            const status = normalizeOptionalString((raw as { status?: unknown }).status);
+            const status = parseExperimentStatus((raw as { status?: unknown }).status);
             if (!id || !candidateId || !status) {
-              return null;
-            }
-            if (
-              status !== "active" &&
-              status !== "passed" &&
-              status !== "failed" &&
-              status !== "cancelled"
-            ) {
               return null;
             }
             return {

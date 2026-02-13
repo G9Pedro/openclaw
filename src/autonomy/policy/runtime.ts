@@ -10,7 +10,7 @@ export function createDefaultAutonomyPolicyConfig(
     version: partial?.version?.trim() || DEFAULT_AUTONOMY_POLICY_VERSION,
     destructiveActionsRequireApproval: partial?.destructiveActionsRequireApproval !== false,
     reversibleWriteActionsRequireApproval: partial?.reversibleWriteActionsRequireApproval === true,
-    actionClassOverrides: { ...(partial?.actionClassOverrides ?? {}) },
+    actionClassOverrides: { ...partial?.actionClassOverrides },
     explicitAllowActions: [...(partial?.explicitAllowActions ?? [])],
     explicitDenyActions: [...(partial?.explicitDenyActions ?? [])],
   };
