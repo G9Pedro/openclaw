@@ -290,6 +290,8 @@ export async function runCronIsolatedAgentTurn(params: {
       error: params.error,
       events: autonomyRuntime.events,
       droppedDuplicates: autonomyRuntime.droppedDuplicates,
+      droppedInvalid: autonomyRuntime.droppedInvalid,
+      droppedOverflow: autonomyRuntime.droppedOverflow,
       remainingEvents: autonomyRuntime.remainingEvents,
       usage: params.usage,
       lockToken: autonomyRuntime.lockToken,
@@ -580,7 +582,7 @@ export async function runCronIsolatedAgentTurn(params: {
     return { status: "ok", summary, outputText };
   } finally {
     if (autonomyRuntime && !("skipped" in autonomyRuntime) && !autonomyCycleClosed) {
-      releaseAutonomyRunLock(autonomyRuntime.state.agentId, autonomyRuntime.lockToken);
+      await releaseAutonomyRunLock(autonomyRuntime.state.agentId, autonomyRuntime.lockToken);
     }
   }
 }

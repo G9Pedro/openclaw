@@ -1,3 +1,6 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { CronAutonomyConfig } from "../cron/types.js";
 import type { AutonomyEvent, AutonomyState } from "./types.js";
 import {
@@ -22,6 +25,7 @@ import {
   recordAutonomyCycle,
   recordAutonomyEvents,
   refreshAutonomyBudgetWindow,
+  resolveAutonomyLockPath,
   resolveIsoWeekKey,
   saveAutonomyState,
 } from "./store.js";
@@ -31,6 +35,8 @@ export type AutonomyRuntimePrepared = {
   prompt: string;
   events: AutonomyEvent[];
   droppedDuplicates: number;
+  droppedInvalid: number;
+  droppedOverflow: number;
   remainingEvents: number;
   cycleStartedAt: number;
   lockToken: string;
@@ -44,22 +50,100 @@ export type AutonomyUsageSnapshot = {
   total?: number;
 };
 
-const activeRuns = new Map<string, string>();
+const RUN_LOCK_TTL_MS = 6 * 60 * 60_000;
+const activeRuns = new Map<string, { token: string; expiresAt: number }>();
 
-function acquireAutonomyRunLock(agentId: string): string | null {
-  if (activeRuns.has(agentId)) {
+function parseRunLock(raw: string) {
+  if (!raw.trim()) {
     return null;
   }
-  const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  activeRuns.set(agentId, token);
-  return token;
+  try {
+    const parsed = JSON.parse(raw) as { token?: unknown; expiresAt?: unknown };
+    if (typeof parsed.token !== "string" || !parsed.token.trim()) {
+      return null;
+    }
+    if (typeof parsed.expiresAt !== "number" || !Number.isFinite(parsed.expiresAt)) {
+      return null;
+    }
+    return {
+      token: parsed.token,
+      expiresAt: Math.max(0, Math.floor(parsed.expiresAt)),
+    };
+  } catch {
+    return null;
+  }
 }
 
-export function releaseAutonomyRunLock(agentId: string, token: string) {
-  if (activeRuns.get(agentId) !== token) {
-    return;
+async function tryCreateRunLockFile(lockPath: string, payload: string) {
+  try {
+    const handle = await fs.open(lockPath, "wx");
+    try {
+      await handle.writeFile(payload, "utf-8");
+    } finally {
+      await handle.close();
+    }
+    return true;
+  } catch (error) {
+    if ((error as { code?: string }).code === "EEXIST") {
+      return false;
+    }
+    throw error;
   }
-  activeRuns.delete(agentId);
+}
+
+async function acquireAutonomyRunLock(agentId: string, nowMs: number): Promise<string | null> {
+  const active = activeRuns.get(agentId);
+  if (active && active.expiresAt > nowMs) {
+    return null;
+  }
+  if (active && active.expiresAt <= nowMs) {
+    activeRuns.delete(agentId);
+  }
+
+  const lockPath = resolveAutonomyLockPath(agentId);
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const rawLock = await fs.readFile(lockPath, "utf-8").catch(() => "");
+    const parsedLock = parseRunLock(rawLock);
+    if (parsedLock && parsedLock.expiresAt > nowMs) {
+      return null;
+    }
+    if (rawLock.trim()) {
+      await fs.rm(lockPath, { force: true }).catch(() => undefined);
+    }
+    const token = crypto.randomUUID();
+    const expiresAt = nowMs + RUN_LOCK_TTL_MS;
+    const payload = JSON.stringify(
+      {
+        token,
+        acquiredAt: nowMs,
+        expiresAt,
+      },
+      null,
+      2,
+    );
+    const created = await tryCreateRunLockFile(lockPath, payload);
+    if (!created) {
+      continue;
+    }
+    activeRuns.set(agentId, { token, expiresAt });
+    return token;
+  }
+  return null;
+}
+
+export async function releaseAutonomyRunLock(agentId: string, token: string) {
+  const active = activeRuns.get(agentId);
+  if (active && active.token === token) {
+    activeRuns.delete(agentId);
+  }
+
+  const lockPath = resolveAutonomyLockPath(agentId);
+  const rawLock = await fs.readFile(lockPath, "utf-8").catch(() => "");
+  const parsedLock = parseRunLock(rawLock);
+  if (!parsedLock || parsedLock.token === token || parsedLock.expiresAt <= Date.now()) {
+    await fs.rm(lockPath, { force: true }).catch(() => undefined);
+  }
 }
 
 function normalizeDedupeWindowMs(minutes: number | undefined, fallbackMs: number) {
@@ -318,7 +402,7 @@ export async function prepareAutonomyRuntime(params: {
     return { skipped: true, reason, state };
   }
 
-  const lockToken = acquireAutonomyRunLock(state.agentId);
+  const lockToken = await acquireAutonomyRunLock(state.agentId, nowMs);
   if (!lockToken) {
     await saveAutonomyState(state);
     return { skipped: true, reason: "autonomy run already in progress", state };
@@ -358,7 +442,38 @@ export async function prepareAutonomyRuntime(params: {
           },
         ]
       : [];
-    const events = [cycleEvent, ...resumeEvent, ...syntheticEvents, ...drained.events];
+    const queueHealthEvents: AutonomyEvent[] = [];
+    if (drained.droppedOverflow > 0) {
+      queueHealthEvents.push({
+        id: `queue-overflow-${nowMs}`,
+        source: "manual",
+        type: "autonomy.queue.overflow",
+        ts: nowMs,
+        dedupeKey: `autonomy.queue.overflow:${state.budget.dayKey}`,
+        payload: {
+          droppedOverflow: drained.droppedOverflow,
+        },
+      });
+    }
+    if (drained.droppedInvalid > 0) {
+      queueHealthEvents.push({
+        id: `queue-invalid-${nowMs}`,
+        source: "manual",
+        type: "autonomy.queue.invalid",
+        ts: nowMs,
+        dedupeKey: `autonomy.queue.invalid:${Math.floor(nowMs / 60_000)}`,
+        payload: {
+          droppedInvalid: drained.droppedInvalid,
+        },
+      });
+    }
+    const events = [
+      cycleEvent,
+      ...resumeEvent,
+      ...queueHealthEvents,
+      ...syntheticEvents,
+      ...drained.events,
+    ];
     recordAutonomyEvents(state, events);
 
     const basePrompt = buildAutonomousCoordinationPrompt({
@@ -398,12 +513,14 @@ export async function prepareAutonomyRuntime(params: {
       prompt: `${basePrompt}\n\n${preamble}`.trim(),
       events,
       droppedDuplicates: drained.droppedDuplicates,
+      droppedInvalid: drained.droppedInvalid,
+      droppedOverflow: drained.droppedOverflow,
       remainingEvents: drained.remaining,
       cycleStartedAt: nowMs,
       lockToken,
     };
   } catch (error) {
-    releaseAutonomyRunLock(state.agentId, lockToken);
+    await releaseAutonomyRunLock(state.agentId, lockToken);
     throw error;
   }
 }
@@ -417,6 +534,8 @@ export async function finalizeAutonomyRuntime(params: {
   error?: string;
   events: AutonomyEvent[];
   droppedDuplicates: number;
+  droppedInvalid?: number;
+  droppedOverflow?: number;
   remainingEvents: number;
   usage?: AutonomyUsageSnapshot;
   lockToken?: string;
@@ -465,6 +584,8 @@ export async function finalizeAutonomyRuntime(params: {
       error: params.error,
       processedEvents: params.events,
       droppedDuplicates: params.droppedDuplicates,
+      droppedInvalid: params.droppedInvalid,
+      droppedOverflow: params.droppedOverflow,
       remainingEvents: params.remainingEvents,
       budgetDayKey: params.state.budget.dayKey,
       budgetCyclesUsed: params.state.budget.cyclesUsed,
@@ -473,7 +594,7 @@ export async function finalizeAutonomyRuntime(params: {
     await saveAutonomyState(params.state);
   } finally {
     if (typeof params.lockToken === "string") {
-      releaseAutonomyRunLock(params.state.agentId, params.lockToken);
+      await releaseAutonomyRunLock(params.state.agentId, params.lockToken);
     }
   }
 }

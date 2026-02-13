@@ -87,6 +87,49 @@ describe("autonomy store", () => {
     expect(drainedAgain.events).toHaveLength(0);
   });
 
+  it("recovers from backup when primary state file is corrupted", async () => {
+    const store = await import("./store.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.mission = "recover mission";
+    await store.saveAutonomyState(state);
+
+    await fs.writeFile(store.resolveAutonomyStatePath("ops"), "{not-json", "utf-8");
+
+    const recovered = await store.loadAutonomyState({ agentId: "ops" });
+    expect(recovered.mission).toBe("recover mission");
+  });
+
+  it("drops overflow and invalid queue entries while retaining recent signals", async () => {
+    const store = await import("./store.js");
+    const state = await store.loadAutonomyState({
+      agentId: "ops",
+      defaults: { maxQueuedEvents: 2 },
+    });
+    const eventsPath = store.resolveAutonomyEventsPath("ops");
+    await fs.mkdir(path.dirname(eventsPath), { recursive: true });
+    const lines = Array.from({ length: 5005 }, (_, index) =>
+      JSON.stringify({
+        id: `evt-${index}`,
+        source: "manual",
+        type: "task.created",
+        ts: 1_000 + index,
+        dedupeKey: `k-${index}`,
+      }),
+    );
+    lines.splice(20, 0, "{broken-json");
+    await fs.writeFile(eventsPath, `${lines.join("\n")}\n`, "utf-8");
+
+    const drained = await store.drainAutonomyEvents({
+      agentId: "ops",
+      state,
+      nowMs: 2_000_000,
+    });
+    expect(drained.events).toHaveLength(2);
+    expect(drained.droppedOverflow).toBeGreaterThan(0);
+    expect(drained.droppedInvalid).toBeGreaterThan(0);
+    expect(drained.remaining).toBeGreaterThan(0);
+  });
+
   it("records cycles and writes markdown run log", async () => {
     const store = await import("./store.js");
     const state = await store.loadAutonomyState({ agentId: "ops" });

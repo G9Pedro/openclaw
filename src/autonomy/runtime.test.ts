@@ -349,4 +349,118 @@ describe("autonomy runtime", () => {
       lockToken: first.lockToken,
     });
   });
+
+  it("skips run when a non-stale lock file already exists", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const lockPath = store.resolveAutonomyLockPath("ops");
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        token: "external-token",
+        acquiredAt: Date.now() - 1000,
+        expiresAt: Date.now() + 60_000,
+      }),
+      "utf-8",
+    );
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    expect("skipped" in prepared && prepared.skipped).toBe(true);
+    if ("skipped" in prepared) {
+      expect(prepared.reason).toContain("already in progress");
+    }
+  });
+
+  it("clears stale lock file and continues cycle", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const lockPath = store.resolveAutonomyLockPath("ops");
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        token: "stale-token",
+        acquiredAt: Date.now() - 8 * 60 * 60_000,
+        expiresAt: Date.now() - 1000,
+      }),
+      "utf-8",
+    );
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected stale lock to be recoverable");
+    }
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+
+    const lockStillExists = await fs
+      .access(lockPath)
+      .then(() => true)
+      .catch(() => false);
+    expect(lockStillExists).toBe(false);
+  });
+
+  it("injects queue resilience signals for invalid/overflow events", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const eventsPath = store.resolveAutonomyEventsPath("ops");
+    await fs.mkdir(path.dirname(eventsPath), { recursive: true });
+    const queuedLines = Array.from({ length: 5005 }, (_, index) =>
+      JSON.stringify({
+        id: `evt-${index}`,
+        source: "manual",
+        type: "work.signal",
+        ts: 1_000 + index,
+        dedupeKey: `work-${index}`,
+      }),
+    );
+    queuedLines.push("{bad-json");
+    await fs.writeFile(eventsPath, `${queuedLines.join("\n")}\n`, "utf-8");
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true, maxQueuedEvents: 1 },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(prepared.events.some((event) => event.type === "autonomy.queue.overflow")).toBe(true);
+    expect(prepared.events.some((event) => event.type === "autonomy.queue.invalid")).toBe(true);
+    expect(prepared.droppedOverflow).toBeGreaterThan(0);
+    expect(prepared.droppedInvalid).toBeGreaterThan(0);
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
 });

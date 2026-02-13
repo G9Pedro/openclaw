@@ -12,9 +12,12 @@ import { CONFIG_DIR } from "../utils.js";
 
 const AUTONOMY_DIR = path.join(CONFIG_DIR, "autonomy");
 const STATE_FILENAME = "state.json";
+const STATE_BACKUP_FILENAME = "state.backup.json";
 const EVENTS_FILENAME = "events.jsonl";
+const LOCK_FILENAME = "run.lock";
 const MAX_RECENT_EVENTS = 50;
 const MAX_RECENT_CYCLES = 50;
+const MAX_EVENT_QUEUE_LINES = 5000;
 const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
 const DEFAULT_MAX_QUEUED_EVENTS = 100;
 const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
@@ -77,6 +80,18 @@ function resolveEventDedupeKey(event: AutonomyEvent) {
     return event.id.trim();
   }
   return `${event.source}:${event.type}`;
+}
+
+function tryParseAutonomyState(raw: string) {
+  if (!raw.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<AutonomyState>;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function pruneDedupeMap(state: AutonomyState, nowMs: number) {
@@ -186,8 +201,16 @@ export function resolveAutonomyStatePath(agentId: string) {
   return path.join(resolveAutonomyAgentDir(agentId), STATE_FILENAME);
 }
 
+export function resolveAutonomyStateBackupPath(agentId: string) {
+  return path.join(resolveAutonomyAgentDir(agentId), STATE_BACKUP_FILENAME);
+}
+
 export function resolveAutonomyEventsPath(agentId: string) {
   return path.join(resolveAutonomyAgentDir(agentId), EVENTS_FILENAME);
+}
+
+export function resolveAutonomyLockPath(agentId: string) {
+  return path.join(resolveAutonomyAgentDir(agentId), LOCK_FILENAME);
 }
 
 export async function hasAutonomyState(agentId: string) {
@@ -237,18 +260,17 @@ export async function loadAutonomyState(params: {
   defaults?: PartialAutonomyState;
 }): Promise<AutonomyState> {
   const statePath = resolveAutonomyStatePath(params.agentId);
+  const backupPath = resolveAutonomyStateBackupPath(params.agentId);
   const raw = await fs.readFile(statePath, "utf-8").catch(() => "");
-  if (!raw.trim()) {
+  const parsedPrimary = tryParseAutonomyState(raw);
+  const parsedBackup =
+    parsedPrimary ?? tryParseAutonomyState(await fs.readFile(backupPath, "utf-8").catch(() => ""));
+  if (!raw.trim() && !parsedBackup) {
     const state = buildDefaultState(params.agentId, params.defaults);
     await saveAutonomyState(state);
     return state;
   }
-  let parsed: Partial<AutonomyState> | null = null;
-  try {
-    parsed = JSON.parse(raw) as Partial<AutonomyState>;
-  } catch {
-    parsed = null;
-  }
+  const parsed = parsedBackup;
   const state = buildDefaultState(params.agentId, params.defaults);
   if (parsed && typeof parsed === "object") {
     state.mission = normalizeOptionalString(parsed.mission) ?? state.mission;
@@ -389,17 +411,22 @@ export async function loadAutonomyState(params: {
     state.pauseReason = "manual";
   }
   refreshAutonomyBudgetWindow(state);
+  if (!parsed) {
+    await saveAutonomyState(state);
+  }
   return state;
 }
 
 export async function saveAutonomyState(state: AutonomyState) {
   const statePath = resolveAutonomyStatePath(state.agentId);
+  const backupPath = resolveAutonomyStateBackupPath(state.agentId);
   const payload = JSON.stringify(state, null, 2);
   await withSerializedWrite(statePath, async () => {
     await fs.mkdir(path.dirname(statePath), { recursive: true });
     const tmp = `${statePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
     await fs.writeFile(tmp, payload, "utf-8");
     await fs.rename(tmp, statePath);
+    await fs.writeFile(backupPath, payload, "utf-8");
   });
 }
 
@@ -439,16 +466,25 @@ export async function drainAutonomyEvents(params: {
   const raw = await fs.readFile(eventsPath, "utf-8").catch(() => "");
   if (!raw.trim()) {
     pruneDedupeMap(params.state, nowMs);
-    return { events: [] as AutonomyEvent[], droppedDuplicates: 0, remaining: 0 };
+    return {
+      events: [] as AutonomyEvent[],
+      droppedDuplicates: 0,
+      droppedInvalid: 0,
+      droppedOverflow: 0,
+      remaining: 0,
+    };
   }
 
-  const lines = raw
+  const allLines = raw
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+  const droppedOverflow = Math.max(0, allLines.length - MAX_EVENT_QUEUE_LINES);
+  const lines = droppedOverflow > 0 ? allLines.slice(-MAX_EVENT_QUEUE_LINES) : allLines;
   const selected: AutonomyEvent[] = [];
   const remaining: AutonomyEvent[] = [];
   let droppedDuplicates = 0;
+  let droppedInvalid = 0;
   for (const line of lines) {
     let parsed: AutonomyEvent | null = null;
     try {
@@ -457,11 +493,21 @@ export async function drainAutonomyEvents(params: {
       parsed = null;
     }
     if (!parsed || typeof parsed !== "object") {
+      droppedInvalid += 1;
       continue;
     }
+    const sourceRaw = (parsed as { source?: unknown }).source;
+    const source =
+      sourceRaw === "cron" ||
+      sourceRaw === "webhook" ||
+      sourceRaw === "email" ||
+      sourceRaw === "subagent" ||
+      sourceRaw === "manual"
+        ? sourceRaw
+        : "manual";
     const event: AutonomyEvent = {
       id: normalizeOptionalString(parsed.id) ?? crypto.randomUUID(),
-      source: parsed.source,
+      source,
       type: normalizeOptionalString(parsed.type) ?? "event",
       ts: Number.isFinite(parsed.ts) ? parsed.ts : nowMs,
       dedupeKey: normalizeOptionalString(parsed.dedupeKey),
@@ -494,7 +540,13 @@ export async function drainAutonomyEvents(params: {
     await fs.writeFile(eventsPath, serializedRemaining, "utf-8");
   });
 
-  return { events: selected, droppedDuplicates, remaining: remaining.length };
+  return {
+    events: selected,
+    droppedDuplicates,
+    droppedInvalid,
+    droppedOverflow,
+    remaining: remaining.length,
+  };
 }
 
 export function recordAutonomyCycle(state: AutonomyState, cycle: AutonomyCycleRecord) {
@@ -591,6 +643,8 @@ export async function appendAutonomyWorkspaceLog(params: {
   error?: string;
   processedEvents: AutonomyEvent[];
   droppedDuplicates?: number;
+  droppedInvalid?: number;
+  droppedOverflow?: number;
   remainingEvents?: number;
   budgetDayKey?: string;
   budgetCyclesUsed?: number;
@@ -605,6 +659,12 @@ export async function appendAutonomyWorkspaceLog(params: {
     `Processed events: ${params.processedEvents.length}`,
     typeof params.droppedDuplicates === "number"
       ? `Dropped duplicate events: ${params.droppedDuplicates}`
+      : undefined,
+    typeof params.droppedInvalid === "number"
+      ? `Dropped invalid events: ${params.droppedInvalid}`
+      : undefined,
+    typeof params.droppedOverflow === "number"
+      ? `Dropped overflow events: ${params.droppedOverflow}`
       : undefined,
     typeof params.remainingEvents === "number"
       ? `Queued events remaining: ${params.remainingEvents}`
