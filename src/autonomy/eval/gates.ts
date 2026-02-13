@@ -3,8 +3,10 @@ export type PromotionGateInput = {
   recentCycleCount: number;
   recentErrorCount: number;
   canaryStatus?: "healthy" | "regressed";
+  evalScore?: number;
   minimumRecentCycles?: number;
   maximumErrorRate?: number;
+  minimumEvalScore?: number;
 };
 
 export type PromotionGateResult = {
@@ -27,6 +29,12 @@ export function evaluatePromotionGates(input: PromotionGateInput): PromotionGate
   const maximumErrorRate = Number.isFinite(input.maximumErrorRate)
     ? Math.max(0, Math.min(1, input.maximumErrorRate as number))
     : 0.2;
+  const minimumEvalScore = Number.isFinite(input.minimumEvalScore)
+    ? Math.max(0, Math.min(1, input.minimumEvalScore as number))
+    : 0.6;
+  const evalScore = Number.isFinite(input.evalScore)
+    ? Math.max(0, Math.min(1, input.evalScore as number))
+    : 0;
   const errorRate = recentCycleCount > 0 ? recentErrorCount / recentCycleCount : 1;
 
   if (verifiedCandidateCount <= 0) {
@@ -54,6 +62,13 @@ export function evaluatePromotionGates(input: PromotionGateInput): PromotionGate
     return {
       passed: false,
       reason: "canary status regressed",
+      errorRate,
+    };
+  }
+  if (evalScore < minimumEvalScore) {
+    return {
+      passed: false,
+      reason: `long horizon eval score ${evalScore.toFixed(3)} below minimum ${minimumEvalScore.toFixed(3)}`,
       errorRate,
     };
   }

@@ -45,6 +45,7 @@ describe("autonomy store", () => {
     expect(state.augmentation.gaps).toEqual([]);
     expect(state.augmentation.candidates).toEqual([]);
     expect(state.augmentation.activeExperiments).toEqual([]);
+    expect(state.approvals).toEqual({});
     expect(state.taskSignals).toEqual({});
 
     const statePath = store.resolveAutonomyStatePath("ops");
@@ -211,6 +212,29 @@ describe("autonomy store", () => {
     expect(loaded.tasks.length).toBeLessThanOrEqual(2000);
     expect(loaded.augmentation.gaps.length).toBeLessThanOrEqual(200);
     expect(loaded.augmentation.candidates.length).toBeLessThanOrEqual(250);
+  });
+
+  it("drops expired approvals while keeping active approvals", async () => {
+    const store = await import("./store.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    const nowMs = Date.now();
+    state.approvals["autonomy.stage.promote"] = {
+      action: "autonomy.stage.promote",
+      source: "manual",
+      approvedAt: nowMs - 1_000,
+      expiresAt: nowMs + 60_000,
+    };
+    state.approvals["autonomy.stage.retire"] = {
+      action: "autonomy.stage.retire",
+      source: "manual",
+      approvedAt: nowMs - 120_000,
+      expiresAt: nowMs - 60_000,
+    };
+    await store.saveAutonomyState(state);
+
+    const loaded = await store.loadAutonomyState({ agentId: "ops" });
+    expect(loaded.approvals["autonomy.stage.promote"]).toBeDefined();
+    expect(loaded.approvals["autonomy.stage.retire"]).toBeUndefined();
   });
 
   it("records cycles and writes markdown run log", async () => {

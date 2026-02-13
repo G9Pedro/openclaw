@@ -44,6 +44,7 @@ function buildState(): AutonomyState {
       activeExperiments: [],
       transitions: [],
     },
+    approvals: {},
     taskSignals: {},
     dedupe: {},
     goals: [],

@@ -90,6 +90,13 @@ export type AutonomyReviewState = {
   lastWeeklyReviewKey?: string;
 };
 
+export type AutonomyOperatorApproval = {
+  action: string;
+  approvedAt: number;
+  expiresAt: number;
+  source: AutonomyEventSource;
+};
+
 export type AutonomyAugmentationStage =
   | "discover"
   | "design"
@@ -171,6 +178,8 @@ export type AutonomyAugmentationState = {
   lastTransitionReason?: string;
   phaseRunCount: number;
   policyVersion: string;
+  lastEvalScore?: number;
+  lastEvalAt?: number;
   gaps: AutonomyAugmentationGap[];
   candidates: AutonomySkillCandidate[];
   activeExperiments: AutonomyAugmentationExperiment[];
@@ -194,6 +203,7 @@ export type AutonomyState = {
   budget: AutonomyBudgetUsage;
   review: AutonomyReviewState;
   augmentation: AutonomyAugmentationState;
+  approvals: Record<string, AutonomyOperatorApproval>;
   taskSignals: Record<string, string>;
   dedupe: Record<string, number>;
   goals: AutonomyGoal[];

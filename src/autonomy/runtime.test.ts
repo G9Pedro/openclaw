@@ -745,4 +745,153 @@ describe("autonomy runtime", () => {
       lockToken: prepared.lockToken,
     });
   });
+
+  it("consumes operator approval event to allow destructive stage transition", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.augmentation.stage = "canary";
+    state.augmentation.candidates = [
+      {
+        id: "candidate-approve",
+        sourceGapId: "gap-approve",
+        name: "autonomy-approve-skill",
+        intent: "allow promote transition",
+        status: "verified",
+        priority: 100,
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+        safety: {
+          executionClass: "reversible_write",
+          constraints: ["must be reversible and observable"],
+        },
+        tests: ["unit: verifies approval bridge"],
+      },
+    ];
+    state.recentCycles = [
+      {
+        ts: Date.now() - 5_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 100,
+      },
+      {
+        ts: Date.now() - 4_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 110,
+      },
+      {
+        ts: Date.now() - 3_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 120,
+      },
+    ];
+    await store.saveAutonomyState(state);
+    await store.enqueueAutonomyEvent({
+      agentId: "ops",
+      source: "manual",
+      type: "autonomy.approval.grant",
+      payload: {
+        action: "autonomy.stage.promote",
+        ttlMinutes: 30,
+      },
+    });
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(prepared.state.augmentation.stage).toBe("promote");
+    expect(prepared.state.approvals["autonomy.stage.promote"]).toBeUndefined();
+    expect(prepared.events.some((event) => event.type === "autonomy.approval.applied")).toBe(true);
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
+
+  it("records long-horizon eval score during promote checks", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.augmentation.stage = "promote";
+    state.augmentation.candidates = [
+      {
+        id: "candidate-promote",
+        sourceGapId: "gap-promote",
+        name: "autonomy-promote-skill",
+        intent: "pass promote stage",
+        status: "verified",
+        priority: 100,
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+        safety: {
+          executionClass: "reversible_write",
+          constraints: ["must be reversible and observable"],
+        },
+        tests: ["unit: promote eval"],
+      },
+    ];
+    state.recentCycles = [
+      {
+        ts: Date.now() - 8_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 100,
+      },
+      {
+        ts: Date.now() - 7_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 105,
+      },
+      {
+        ts: Date.now() - 6_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 110,
+      },
+    ];
+    await store.saveAutonomyState(state);
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(typeof prepared.state.augmentation.lastEvalScore).toBe("number");
+    expect(prepared.state.augmentation.lastEvalScore).toBeGreaterThan(0);
+    expect(prepared.state.augmentation.lastEvalAt).toBeDefined();
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
 });

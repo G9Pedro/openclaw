@@ -21,6 +21,7 @@ import { evaluateCanaryHealth } from "./canary/manager.js";
 import { upsertGapRegistry } from "./discovery/gap-registry.js";
 import { normalizeAutonomySignals } from "./discovery/signal-normalizer.js";
 import { evaluatePromotionGates } from "./eval/gates.js";
+import { runLongHorizonScenarioPack } from "./eval/long-horizon-runner.js";
 import {
   createAugmentationPhaseEnterEvent,
   createAugmentationPhaseExitEvent,
@@ -318,6 +319,110 @@ function resolveRecentCanaryStatus(state: AutonomyState): "healthy" | "regressed
   return undefined;
 }
 
+const DEFAULT_APPROVAL_TTL_MINUTES = 60;
+const MAX_APPROVAL_TTL_MINUTES = 24 * 30;
+
+function resolveApprovalAction(payload: Record<string, unknown> | undefined) {
+  const action = payload?.action;
+  return typeof action === "string" && action.trim() ? action.trim() : undefined;
+}
+
+function resolveApprovalTtlMinutes(payload: Record<string, unknown> | undefined) {
+  const ttlRaw = payload?.ttlMinutes;
+  if (typeof ttlRaw !== "number" || !Number.isFinite(ttlRaw)) {
+    return DEFAULT_APPROVAL_TTL_MINUTES;
+  }
+  return Math.max(1, Math.min(MAX_APPROVAL_TTL_MINUTES, Math.floor(ttlRaw)));
+}
+
+function hasOperatorApprovalForAction(state: AutonomyState, action: string, nowMs: number) {
+  const approval = state.approvals[action];
+  if (!approval) {
+    return false;
+  }
+  return approval.expiresAt > nowMs;
+}
+
+async function applyOperatorApprovalEvents(params: {
+  state: AutonomyState;
+  nowMs: number;
+  events: AutonomyEvent[];
+  correlationId: string;
+}) {
+  const emitted: AutonomyEvent[] = [];
+  for (const event of params.events) {
+    if (event.type !== "autonomy.approval.grant" && event.type !== "autonomy.approval.revoke") {
+      continue;
+    }
+    const action = resolveApprovalAction(event.payload);
+    if (!action) {
+      continue;
+    }
+    if (event.type === "autonomy.approval.grant") {
+      const ttlMinutes = resolveApprovalTtlMinutes(event.payload);
+      params.state.approvals[action] = {
+        action,
+        source: event.source,
+        approvedAt: params.nowMs,
+        expiresAt: params.nowMs + ttlMinutes * 60_000,
+      };
+      emitted.push({
+        id: `approval-granted-${action}-${params.nowMs}`,
+        source: "manual",
+        type: "autonomy.approval.applied",
+        ts: params.nowMs,
+        dedupeKey: `autonomy.approval.applied:${action}:${Math.floor(params.nowMs / 60_000)}`,
+        payload: {
+          action,
+          granted: true,
+          ttlMinutes,
+        },
+      });
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId: params.correlationId,
+        eventType: "approval_update",
+        stage: params.state.augmentation.stage,
+        actor: "operator-approval",
+        summary: `approval granted for ${action}`,
+        evidence: {
+          action,
+          ttlMinutes,
+          source: event.source,
+        },
+        ts: params.nowMs,
+      });
+      continue;
+    }
+    delete params.state.approvals[action];
+    emitted.push({
+      id: `approval-revoked-${action}-${params.nowMs}`,
+      source: "manual",
+      type: "autonomy.approval.applied",
+      ts: params.nowMs,
+      dedupeKey: `autonomy.approval.revoked:${action}:${Math.floor(params.nowMs / 60_000)}`,
+      payload: {
+        action,
+        granted: false,
+      },
+    });
+    await appendAutonomyLedgerEntry({
+      agentId: params.state.agentId,
+      correlationId: params.correlationId,
+      eventType: "approval_update",
+      stage: params.state.augmentation.stage,
+      actor: "operator-approval",
+      summary: `approval revoked for ${action}`,
+      evidence: {
+        action,
+        source: event.source,
+      },
+      ts: params.nowMs,
+    });
+  }
+  return emitted;
+}
+
 async function processAugmentationCycle(params: {
   state: AutonomyState;
   nowMs: number;
@@ -327,6 +432,18 @@ async function processAugmentationCycle(params: {
   const correlationId = `cycle-${params.nowMs}`;
   const augmentationEvents: AutonomyEvent[] = [];
   params.state.augmentation.phaseRunCount += 1;
+  for (const [action, approval] of Object.entries(params.state.approvals)) {
+    if (!approval || approval.expiresAt <= params.nowMs) {
+      delete params.state.approvals[action];
+    }
+  }
+  const approvalEvents = await applyOperatorApprovalEvents({
+    state: params.state,
+    nowMs: params.nowMs,
+    events: params.events,
+    correlationId,
+  });
+  augmentationEvents.push(...approvalEvents);
 
   const hookRunner = getGlobalHookRunner();
   let pluginSignalEvents: AutonomyEvent[] = [];
@@ -547,11 +664,22 @@ async function processAugmentationCycle(params: {
     const verifiedCandidateCount = params.state.augmentation.candidates.filter(
       (candidate) => candidate.status === "verified",
     ).length;
+    const evalReport = runLongHorizonScenarioPack({
+      state: {
+        augmentation: params.state.augmentation,
+        recentCycles: params.state.recentCycles,
+        tasks: params.state.tasks,
+      },
+    });
+    params.state.augmentation.lastEvalScore = evalReport.score;
+    params.state.augmentation.lastEvalAt = params.nowMs;
     const gate = evaluatePromotionGates({
       verifiedCandidateCount,
       recentCycleCount: actionable.length,
       recentErrorCount,
       canaryStatus: resolveRecentCanaryStatus(params.state),
+      evalScore: evalReport.score,
+      minimumEvalScore: 0.6,
     });
     if (!gate.passed) {
       nextStage = stageBeforeActions;
@@ -586,6 +714,8 @@ async function processAugmentationCycle(params: {
           recentCycleCount: actionable.length,
           recentErrorCount,
           errorRate: gate.errorRate,
+          evalScore: evalReport.score,
+          scenarios: evalReport.results,
         },
         ts: params.nowMs,
       });
@@ -606,7 +736,7 @@ async function processAugmentationCycle(params: {
       action,
       executionClass,
       config: policyConfig,
-      approvedByOperator: false,
+      approvedByOperator: hasOperatorApprovalForAction(params.state, action, params.nowMs),
     });
 
     if (!policyDecision.allowed) {
@@ -643,6 +773,12 @@ async function processAugmentationCycle(params: {
         ts: params.nowMs,
       });
       return augmentationEvents;
+    }
+    if (
+      executionClass !== "read_only" &&
+      hasOperatorApprovalForAction(params.state, action, params.nowMs)
+    ) {
+      delete params.state.approvals[action];
     }
   }
 
@@ -984,6 +1120,7 @@ export async function prepareAutonomyRuntime(params: {
         stage: state.augmentation.stage,
         gaps: state.augmentation.gaps.length,
         candidates: state.augmentation.candidates.length,
+        approvals: Object.keys(state.approvals).length,
       },
     });
     await saveAutonomyState(state);

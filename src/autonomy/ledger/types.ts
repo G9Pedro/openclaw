@@ -6,6 +6,7 @@ export type AutonomyLedgerEventType =
   | "policy_denied"
   | "discovery_update"
   | "candidate_update"
+  | "approval_update"
   | "promotion"
   | "rollback";
 

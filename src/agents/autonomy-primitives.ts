@@ -113,6 +113,7 @@ export type AutonomousCycleContext = {
     stage: string;
     gaps: number;
     candidates: number;
+    approvals?: number;
   };
 };
 
@@ -137,7 +138,7 @@ export function buildAutonomousCyclePreamble(context: AutonomousCycleContext) {
   }
   if (context.augmentation) {
     lines.push(
-      `Augmentation: stage=${context.augmentation.stage}, gaps=${context.augmentation.gaps}, candidates=${context.augmentation.candidates}`,
+      `Augmentation: stage=${context.augmentation.stage}, gaps=${context.augmentation.gaps}, candidates=${context.augmentation.candidates}, approvals=${context.augmentation.approvals ?? 0}`,
     );
     lines.push("");
   }

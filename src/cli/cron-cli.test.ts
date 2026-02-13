@@ -47,11 +47,14 @@ const loadAutonomyState = vi.fn(async () => ({
     lastTransitionReason: "boot",
     phaseRunCount: 4,
     policyVersion: "2026-02-13",
+    lastEvalScore: 0.82,
+    lastEvalAt: 1_700_000_000_500,
     gaps: [],
     candidates: [],
     activeExperiments: [],
     transitions: [],
   },
+  approvals: {},
   taskSignals: {},
   dedupe: {},
   goals: [],
@@ -830,5 +833,66 @@ describe("cron cli", () => {
         dedupeKey: "evt-123",
       }),
     );
+  });
+
+  it("queues approval grant and revoke events", async () => {
+    enqueueAutonomyEvent.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(
+      [
+        "cron",
+        "autonomous-approve",
+        "--agent",
+        "ops",
+        "--action",
+        "autonomy.stage.promote",
+        "--ttl-minutes",
+        "30",
+      ],
+      { from: "user" },
+    );
+    expect(enqueueAutonomyEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "ops",
+        type: "autonomy.approval.grant",
+        payload: {
+          action: "autonomy.stage.promote",
+          ttlMinutes: 30,
+        },
+      }),
+    );
+
+    enqueueAutonomyEvent.mockClear();
+    await program.parseAsync(
+      ["cron", "autonomous-revoke", "--agent", "ops", "--action", "autonomy.stage.promote"],
+      { from: "user" },
+    );
+    expect(enqueueAutonomyEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "ops",
+        type: "autonomy.approval.revoke",
+        payload: {
+          action: "autonomy.stage.promote",
+        },
+      }),
+    );
+  });
+
+  it("runs autonomy eval command", async () => {
+    loadAutonomyState.mockClear();
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(["cron", "autonomous-eval", "--agent", "ops", "--json"], {
+      from: "user",
+    });
+    expect(loadAutonomyState).toHaveBeenCalledWith({ agentId: "ops" });
   });
 });

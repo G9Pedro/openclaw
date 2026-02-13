@@ -7,6 +7,7 @@ import {
   DEFAULT_AUTONOMY_MISSION,
   DEFAULT_AUTONOMY_TASKS_FILE,
 } from "../../agents/autonomy-primitives.js";
+import { runLongHorizonScenarioPack } from "../../autonomy/eval/long-horizon-runner.js";
 import { readAutonomyLedgerEntries } from "../../autonomy/ledger/store.js";
 import {
   enqueueAutonomyEvent,
@@ -325,9 +326,12 @@ export function registerCronAutonomousCommand(cron: Command) {
               `augmentation.lastTransitionReason=${state.augmentation.lastTransitionReason ?? "-"}`,
               `augmentation.policyVersion=${state.augmentation.policyVersion}`,
               `augmentation.phaseRunCount=${state.augmentation.phaseRunCount}`,
+              `augmentation.lastEvalScore=${state.augmentation.lastEvalScore ?? "-"}`,
+              `augmentation.lastEvalAt=${state.augmentation.lastEvalAt ?? "-"}`,
               `augmentation.gaps=${state.augmentation.gaps.length}`,
               `augmentation.candidates=${state.augmentation.candidates.length}`,
               `augmentation.activeExperiments=${state.augmentation.activeExperiments.length}`,
+              `approvals.active=${Object.keys(state.approvals).length}`,
               `metrics.cycles=${state.metrics.cycles}`,
               `metrics.ok=${state.metrics.ok}`,
               `metrics.error=${state.metrics.error}`,
@@ -366,6 +370,9 @@ export function registerCronAutonomousCommand(cron: Command) {
           if (state.metrics.consecutiveErrors > 0) {
             warnings.push(`consecutive errors: ${state.metrics.consecutiveErrors}`);
           }
+          if (Object.keys(state.approvals).length > 0) {
+            warnings.push(`operator approvals active: ${Object.keys(state.approvals).length}`);
+          }
           const stageAgeHours = Math.floor(
             Math.max(0, Date.now() - state.augmentation.stageEnteredAt) / 3_600_000,
           );
@@ -394,6 +401,8 @@ export function registerCronAutonomousCommand(cron: Command) {
             augmentation: {
               stage: state.augmentation.stage,
               stageEnteredAt: state.augmentation.stageEnteredAt,
+              lastEvalScore: state.augmentation.lastEvalScore,
+              lastEvalAt: state.augmentation.lastEvalAt,
               gaps: state.augmentation.gaps.length,
               candidates: state.augmentation.candidates.length,
               activeExperiments: state.augmentation.activeExperiments.length,
@@ -418,6 +427,7 @@ export function registerCronAutonomousCommand(cron: Command) {
               `cycles=${health.metrics.cycles} (ok=${health.metrics.ok} error=${health.metrics.error} skipped=${health.metrics.skipped})`,
               `consecutiveErrors=${health.metrics.consecutiveErrors}`,
               `augmentation.stage=${health.augmentation.stage}`,
+              `augmentation.lastEvalScore=${health.augmentation.lastEvalScore ?? "-"}`,
               `augmentation.gaps=${health.augmentation.gaps}`,
               `augmentation.candidates=${health.augmentation.candidates}`,
               `augmentation.activeExperiments=${health.augmentation.activeExperiments}`,
@@ -471,6 +481,119 @@ export function registerCronAutonomousCommand(cron: Command) {
             ),
           ];
           defaultRuntime.log(lines.join("\n"));
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-approve")
+      .description("Grant a temporary operator approval for an autonomy action")
+      .requiredOption("--agent <id>", "Target agent id")
+      .requiredOption("--action <action>", "Action key (e.g. autonomy.stage.promote)")
+      .option("--ttl-minutes <n>", "Approval TTL in minutes", "60")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          const action = getTrimmedString(opts.action);
+          if (!action) {
+            throw new Error("--action is required");
+          }
+          const ttlMinutes = parsePositiveIntOrUndefined(opts.ttlMinutes) ?? 60;
+          const event = await enqueueAutonomyEvent({
+            agentId,
+            source: "manual",
+            type: "autonomy.approval.grant",
+            dedupeKey: `approval.grant:${action}:${Math.floor(Date.now() / 60_000)}`,
+            payload: {
+              action,
+              ttlMinutes,
+            },
+          });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify({ ok: true, event }, null, 2));
+            return;
+          }
+          defaultRuntime.log(
+            `queued approval grant for agent=${agentId}, action=${action}, ttlMinutes=${ttlMinutes}`,
+          );
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-revoke")
+      .description("Revoke an operator approval for an autonomy action")
+      .requiredOption("--agent <id>", "Target agent id")
+      .requiredOption("--action <action>", "Action key")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          const action = getTrimmedString(opts.action);
+          if (!action) {
+            throw new Error("--action is required");
+          }
+          const event = await enqueueAutonomyEvent({
+            agentId,
+            source: "manual",
+            type: "autonomy.approval.revoke",
+            dedupeKey: `approval.revoke:${action}:${Math.floor(Date.now() / 60_000)}`,
+            payload: {
+              action,
+            },
+          });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify({ ok: true, event }, null, 2));
+            return;
+          }
+          defaultRuntime.log(`queued approval revoke for agent=${agentId}, action=${action}`);
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-eval")
+      .description("Run long-horizon autonomy eval scenarios for an agent")
+      .requiredOption("--agent <id>", "Target agent id")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          const state = await loadAutonomyState({ agentId });
+          const report = runLongHorizonScenarioPack({
+            state: {
+              augmentation: state.augmentation,
+              recentCycles: state.recentCycles,
+              tasks: state.tasks,
+            },
+          });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify({ agentId, report }, null, 2));
+            return;
+          }
+          defaultRuntime.log(
+            [
+              `agent=${agentId}`,
+              `eval.score=${report.score.toFixed(3)}`,
+              `eval.scenarios=${report.scenarioCount}`,
+              ...report.results.map(
+                (result) => `- ${result.id} (${result.kind}) score=${result.score.toFixed(3)}`,
+              ),
+            ].join("\n"),
+          );
         } catch (err) {
           defaultRuntime.error(danger(String(err)));
           defaultRuntime.exit(1);

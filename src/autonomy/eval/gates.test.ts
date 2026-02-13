@@ -8,6 +8,7 @@ describe("promotion gates", () => {
       recentCycleCount: 5,
       recentErrorCount: 0,
       canaryStatus: "healthy",
+      evalScore: 0.9,
     });
     expect(result.passed).toBe(false);
     expect(result.reason).toContain("no verified candidates");
@@ -20,6 +21,7 @@ describe("promotion gates", () => {
       recentErrorCount: 3,
       canaryStatus: "healthy",
       maximumErrorRate: 0.2,
+      evalScore: 0.9,
     });
     expect(result.passed).toBe(false);
     expect(result.reason).toContain("error rate");
@@ -32,7 +34,21 @@ describe("promotion gates", () => {
       recentErrorCount: 0,
       canaryStatus: "healthy",
       maximumErrorRate: 0.2,
+      evalScore: 0.9,
     });
     expect(result.passed).toBe(true);
+  });
+
+  it("fails when eval score is below threshold", () => {
+    const result = evaluatePromotionGates({
+      verifiedCandidateCount: 2,
+      recentCycleCount: 5,
+      recentErrorCount: 0,
+      canaryStatus: "healthy",
+      evalScore: 0.3,
+      minimumEvalScore: 0.6,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.reason).toContain("long horizon eval score");
   });
 });

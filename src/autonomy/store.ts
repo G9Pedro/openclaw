@@ -25,6 +25,7 @@ const MAX_AUGMENTATION_GAPS = 200;
 const MAX_AUGMENTATION_CANDIDATES = 250;
 const MAX_AUGMENTATION_EXPERIMENTS = 100;
 const MAX_AUGMENTATION_TRANSITIONS = 200;
+const MAX_OPERATOR_APPROVALS = 200;
 const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
 const DEFAULT_MAX_QUEUED_EVENTS = 100;
 const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
@@ -49,6 +50,7 @@ type PartialAutonomyState = {
   budget?: Partial<AutonomyState["budget"]>;
   review?: Partial<AutonomyState["review"]>;
   augmentation?: Partial<AutonomyState["augmentation"]>;
+  approvals?: AutonomyState["approvals"];
   taskSignals?: AutonomyState["taskSignals"];
 };
 
@@ -305,11 +307,22 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
         defaults.augmentation.policyVersion.trim()
           ? defaults.augmentation.policyVersion.trim()
           : DEFAULT_AUGMENTATION_POLICY_VERSION,
+      lastEvalScore:
+        typeof defaults?.augmentation?.lastEvalScore === "number" &&
+        Number.isFinite(defaults.augmentation.lastEvalScore)
+          ? Math.max(0, Math.min(1, defaults.augmentation.lastEvalScore))
+          : undefined,
+      lastEvalAt:
+        typeof defaults?.augmentation?.lastEvalAt === "number" &&
+        Number.isFinite(defaults.augmentation.lastEvalAt)
+          ? Math.max(0, Math.floor(defaults.augmentation.lastEvalAt))
+          : undefined,
       gaps: [],
       candidates: [],
       activeExperiments: [],
       transitions: [],
     },
+    approvals: defaults?.approvals ? { ...defaults.approvals } : {},
     taskSignals: defaults?.taskSignals ? { ...defaults.taskSignals } : {},
     dedupe: {},
     goals: [],
@@ -517,6 +530,8 @@ export async function loadAutonomyState(params: {
         .lastTransitionReason;
       const phaseRunCountRaw = (parsed.augmentation as { phaseRunCount?: unknown }).phaseRunCount;
       const policyVersionRaw = (parsed.augmentation as { policyVersion?: unknown }).policyVersion;
+      const lastEvalScoreRaw = (parsed.augmentation as { lastEvalScore?: unknown }).lastEvalScore;
+      const lastEvalAtRaw = (parsed.augmentation as { lastEvalAt?: unknown }).lastEvalAt;
       state.augmentation.stage = isAugmentationStage(stageRaw)
         ? stageRaw
         : state.augmentation.stage;
@@ -540,6 +555,14 @@ export async function loadAutonomyState(params: {
         typeof policyVersionRaw === "string" && policyVersionRaw.trim()
           ? policyVersionRaw.trim()
           : state.augmentation.policyVersion;
+      state.augmentation.lastEvalScore =
+        typeof lastEvalScoreRaw === "number" && Number.isFinite(lastEvalScoreRaw)
+          ? Math.max(0, Math.min(1, lastEvalScoreRaw))
+          : undefined;
+      state.augmentation.lastEvalAt =
+        typeof lastEvalAtRaw === "number" && Number.isFinite(lastEvalAtRaw)
+          ? Math.max(0, Math.floor(lastEvalAtRaw))
+          : undefined;
 
       const gapsRaw = (parsed.augmentation as { gaps?: unknown }).gaps;
       if (Array.isArray(gapsRaw)) {
@@ -784,6 +807,46 @@ export async function loadAutonomyState(params: {
           .slice(-MAX_AUGMENTATION_TRANSITIONS);
       }
     }
+    state.approvals =
+      parsed.approvals && typeof parsed.approvals === "object"
+        ? Object.fromEntries(
+            Object.entries(parsed.approvals)
+              .map(([action, raw]) => {
+                if (!raw || typeof raw !== "object") {
+                  return null;
+                }
+                const normalizedAction = normalizeOptionalString(action);
+                const source = parseAutonomyEventSource((raw as { source?: unknown }).source);
+                const approvedAt = (raw as { approvedAt?: unknown }).approvedAt;
+                const expiresAt = (raw as { expiresAt?: unknown }).expiresAt;
+                if (
+                  !normalizedAction ||
+                  !source ||
+                  typeof approvedAt !== "number" ||
+                  !Number.isFinite(approvedAt) ||
+                  typeof expiresAt !== "number" ||
+                  !Number.isFinite(expiresAt)
+                ) {
+                  return null;
+                }
+                return [
+                  normalizedAction,
+                  {
+                    action: normalizedAction,
+                    source,
+                    approvedAt: Math.max(0, Math.floor(approvedAt)),
+                    expiresAt: Math.max(0, Math.floor(expiresAt)),
+                  },
+                ] as const;
+              })
+              .filter(
+                (entry): entry is readonly [string, AutonomyState["approvals"][string]] =>
+                  entry !== null,
+              )
+              .toSorted((a, b) => b[1].expiresAt - a[1].expiresAt)
+              .slice(0, MAX_OPERATOR_APPROVALS),
+          )
+        : {};
     state.taskSignals =
       parsed.taskSignals && typeof parsed.taskSignals === "object" ? { ...parsed.taskSignals } : {};
     state.goals = Array.isArray(parsed.goals) ? parsed.goals.slice(-MAX_STORED_GOALS) : [];
@@ -821,6 +884,25 @@ export async function loadAutonomyState(params: {
     state.pauseReason = "manual";
   }
   pruneDedupeMap(state, Date.now());
+  const nowMs = Date.now();
+  for (const [action, approval] of Object.entries(state.approvals)) {
+    if (!approval || approval.expiresAt <= nowMs) {
+      delete state.approvals[action];
+    }
+  }
+  const approvalEntries = Object.entries(state.approvals).toSorted(
+    (a, b) => b[1].expiresAt - a[1].expiresAt,
+  );
+  if (approvalEntries.length > MAX_OPERATOR_APPROVALS) {
+    const allowed = new Set(
+      approvalEntries.slice(0, MAX_OPERATOR_APPROVALS).map(([action]) => action),
+    );
+    for (const action of Object.keys(state.approvals)) {
+      if (!allowed.has(action)) {
+        delete state.approvals[action];
+      }
+    }
+  }
   refreshAutonomyBudgetWindow(state);
   if (!parsed) {
     await saveAutonomyState(state);
