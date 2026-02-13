@@ -728,7 +728,9 @@ describe("autonomy runtime", () => {
       (event) => event.type === "autonomy.augmentation.policy.denied",
     );
     expect(deniedEvent).toBeDefined();
-    expect(String(deniedEvent?.payload?.reason ?? "")).toContain("no verified candidates");
+    const deniedReason =
+      typeof deniedEvent?.payload?.reason === "string" ? deniedEvent.payload.reason : "";
+    expect(deniedReason).toContain("no verified candidates");
 
     await runtime.finalizeAutonomyRuntime({
       workspaceDir,
