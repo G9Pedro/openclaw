@@ -28,7 +28,10 @@ describe("autonomy store", () => {
     const state = await store.loadAutonomyState({ agentId: "ops" });
     expect(state.agentId).toBe("ops");
     expect(state.metrics.cycles).toBe(0);
+    expect(state.metrics.consecutiveErrors).toBe(0);
     expect(state.paused).toBe(false);
+    expect(state.safety.maxConsecutiveErrors).toBe(5);
+    expect(state.budget.cyclesUsed).toBe(0);
 
     const statePath = store.resolveAutonomyStatePath("ops");
     const raw = await fs.readFile(statePath, "utf-8");
@@ -85,9 +88,18 @@ describe("autonomy store", () => {
       summary: "completed planning cycle",
       processedEvents: 2,
       durationMs: 800,
+      tokenUsage: {
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 15,
+      },
     });
     expect(state.metrics.cycles).toBe(1);
     expect(state.metrics.ok).toBe(1);
+    expect(state.budget.tokensUsed).toBeGreaterThanOrEqual(15);
+    expect(state.budget.cyclesUsed).toBe(1);
 
     const workspaceDir = path.join(tmpDir, "workspace");
     await store.ensureAutonomyWorkspaceFiles({ workspaceDir, state });
@@ -104,5 +116,13 @@ describe("autonomy store", () => {
     const logPath = path.join(workspaceDir, state.logFile);
     const logText = await fs.readFile(logPath, "utf-8");
     expect(logText).toContain("cycle complete");
+  });
+
+  it("resets runtime folder for an agent", async () => {
+    const store = await import("./store.js");
+    await store.loadAutonomyState({ agentId: "ops" });
+    expect(await store.hasAutonomyState("ops")).toBe(true);
+    await store.resetAutonomyRuntime("ops");
+    expect(await store.hasAutonomyState("ops")).toBe(false);
   });
 });

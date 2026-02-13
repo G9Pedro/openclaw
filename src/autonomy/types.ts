@@ -44,6 +44,13 @@ export type AutonomyCycleRecord = {
   error?: string;
   processedEvents: number;
   durationMs: number;
+  tokenUsage?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
 };
 
 export type AutonomyMetrics = {
@@ -51,8 +58,22 @@ export type AutonomyMetrics = {
   ok: number;
   error: number;
   skipped: number;
+  consecutiveErrors: number;
   lastCycleAt?: number;
   lastError?: string;
+};
+
+export type AutonomySafetyPolicy = {
+  dailyTokenBudget?: number;
+  dailyCycleBudget?: number;
+  maxConsecutiveErrors: number;
+  autoPauseOnBudgetExhausted: boolean;
+};
+
+export type AutonomyBudgetUsage = {
+  dayKey: string;
+  cyclesUsed: number;
+  tokensUsed: number;
 };
 
 export type AutonomyState = {
@@ -66,6 +87,8 @@ export type AutonomyState = {
   maxActionsPerRun: number;
   dedupeWindowMs: number;
   maxQueuedEvents: number;
+  safety: AutonomySafetyPolicy;
+  budget: AutonomyBudgetUsage;
   dedupe: Record<string, number>;
   goals: AutonomyGoal[];
   tasks: AutonomyTask[];

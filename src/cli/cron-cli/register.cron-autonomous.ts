@@ -7,7 +7,11 @@ import {
   DEFAULT_AUTONOMY_MISSION,
   DEFAULT_AUTONOMY_TASKS_FILE,
 } from "../../agents/autonomy-primitives.js";
-import { enqueueAutonomyEvent } from "../../autonomy/store.js";
+import {
+  enqueueAutonomyEvent,
+  loadAutonomyState,
+  resetAutonomyRuntime,
+} from "../../autonomy/store.js";
 import { danger } from "../../globals.js";
 import { sanitizeAgentId } from "../../routing/session-key.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -68,6 +72,11 @@ export function registerCronAutonomousCommand(cron: Command) {
       .option("--max-actions <n>", "Max meaningful actions per run", "3")
       .option("--dedupe-window-minutes <n>", "Event dedupe window in minutes", "60")
       .option("--max-queued-events <n>", "Max queued events consumed each cycle", "100")
+      .option("--daily-token-budget <n>", "Daily token budget cap for autonomy cycles")
+      .option("--daily-cycle-budget <n>", "Daily cycle budget cap for autonomy cycles")
+      .option("--max-consecutive-errors <n>", "Auto-pause after N consecutive errors", "5")
+      .option("--auto-pause-on-budget", "Auto-pause when daily budgets are exhausted", true)
+      .option("--no-auto-pause-on-budget", "Do not auto-pause when budgets are exhausted")
       .option("--deliver", "Deliver output to a channel target when configured", false)
       .option("--channel <channel>", `Delivery channel (${getCronChannelOptions()})`, "last")
       .option(
@@ -100,6 +109,10 @@ export function registerCronAutonomousCommand(cron: Command) {
           const logFile = getTrimmedString(opts.logFile) ?? DEFAULT_AUTONOMY_LOG_FILE;
           const dedupeWindowMinutes = parsePositiveIntOrUndefined(opts.dedupeWindowMinutes) ?? 60;
           const maxQueuedEvents = parsePositiveIntOrUndefined(opts.maxQueuedEvents) ?? 100;
+          const dailyTokenBudget = parsePositiveIntOrUndefined(opts.dailyTokenBudget);
+          const dailyCycleBudget = parsePositiveIntOrUndefined(opts.dailyCycleBudget);
+          const maxConsecutiveErrors = parsePositiveIntOrUndefined(opts.maxConsecutiveErrors) ?? 5;
+          const autoPauseOnBudgetExhausted = opts.autoPauseOnBudget !== false;
 
           const agentId =
             typeof opts.agent === "string" && opts.agent.trim()
@@ -136,6 +149,10 @@ export function registerCronAutonomousCommand(cron: Command) {
                 maxActionsPerRun: maxActions,
                 dedupeWindowMinutes,
                 maxQueuedEvents,
+                dailyTokenBudget,
+                dailyCycleBudget,
+                maxConsecutiveErrors,
+                autoPauseOnBudgetExhausted,
               },
             },
             isolation: {
@@ -224,6 +241,163 @@ export function registerCronAutonomousCommand(cron: Command) {
                   enabled: true,
                   paused: false,
                 },
+              },
+            },
+          });
+          defaultRuntime.log(JSON.stringify(res, null, 2));
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-inspect")
+      .description("Inspect autonomy runtime state for an agent")
+      .requiredOption("--agent <id>", "Target agent id")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          const state = await loadAutonomyState({ agentId });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(state, null, 2));
+            return;
+          }
+          defaultRuntime.log(
+            [
+              `agent=${state.agentId}`,
+              `paused=${state.paused}`,
+              `mission=${state.mission}`,
+              `goalsFile=${state.goalsFile}`,
+              `tasksFile=${state.tasksFile}`,
+              `logFile=${state.logFile}`,
+              `maxActionsPerRun=${state.maxActionsPerRun}`,
+              `dedupeWindowMs=${state.dedupeWindowMs}`,
+              `maxQueuedEvents=${state.maxQueuedEvents}`,
+              `budget.day=${state.budget.dayKey}`,
+              `budget.cyclesUsed=${state.budget.cyclesUsed}`,
+              `budget.tokensUsed=${state.budget.tokensUsed}`,
+              `safety.dailyCycleBudget=${state.safety.dailyCycleBudget ?? "unbounded"}`,
+              `safety.dailyTokenBudget=${state.safety.dailyTokenBudget ?? "unbounded"}`,
+              `safety.maxConsecutiveErrors=${state.safety.maxConsecutiveErrors}`,
+              `safety.autoPauseOnBudgetExhausted=${state.safety.autoPauseOnBudgetExhausted}`,
+              `metrics.cycles=${state.metrics.cycles}`,
+              `metrics.ok=${state.metrics.ok}`,
+              `metrics.error=${state.metrics.error}`,
+              `metrics.skipped=${state.metrics.skipped}`,
+              `metrics.consecutiveErrors=${state.metrics.consecutiveErrors}`,
+            ].join("\n"),
+          );
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-reset")
+      .description("Reset autonomy runtime state/events for an agent")
+      .requiredOption("--agent <id>", "Target agent id")
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          await resetAutonomyRuntime(agentId);
+          defaultRuntime.log(`autonomy runtime reset for agent=${agentId}`);
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-tune")
+      .description("Patch autonomy policy fields on an existing autonomous cron job")
+      .argument("<id>", "Job id")
+      .option("--mission <text>", "Update mission")
+      .option("--goals-file <path>", "Update goals file path")
+      .option("--tasks-file <path>", "Update tasks file path")
+      .option("--log-file <path>", "Update log file path")
+      .option("--max-actions <n>", "Update max actions per run")
+      .option("--dedupe-window-minutes <n>", "Update dedupe window (minutes)")
+      .option("--max-queued-events <n>", "Update max queued events")
+      .option("--daily-token-budget <n>", "Update daily token budget")
+      .option("--daily-cycle-budget <n>", "Update daily cycle budget")
+      .option("--max-consecutive-errors <n>", "Update max consecutive errors")
+      .option("--auto-pause-on-budget", "Enable auto-pause on budget exhaustion")
+      .option("--no-auto-pause-on-budget", "Disable auto-pause on budget exhaustion")
+      .option("--pause", "Pause autonomy")
+      .option("--resume", "Resume autonomy")
+      .action(async (id, opts) => {
+        try {
+          if (opts.pause && opts.resume) {
+            throw new Error("Use either --pause or --resume, not both");
+          }
+          const patchAutonomy: Record<string, unknown> = {};
+          const mission = getTrimmedString(opts.mission);
+          const goalsFile = getTrimmedString(opts.goalsFile);
+          const tasksFile = getTrimmedString(opts.tasksFile);
+          const logFile = getTrimmedString(opts.logFile);
+          const maxActions = parsePositiveIntOrUndefined(opts.maxActions);
+          const dedupeWindowMinutes = parsePositiveIntOrUndefined(opts.dedupeWindowMinutes);
+          const maxQueuedEvents = parsePositiveIntOrUndefined(opts.maxQueuedEvents);
+          const dailyTokenBudget = parsePositiveIntOrUndefined(opts.dailyTokenBudget);
+          const dailyCycleBudget = parsePositiveIntOrUndefined(opts.dailyCycleBudget);
+          const maxConsecutiveErrors = parsePositiveIntOrUndefined(opts.maxConsecutiveErrors);
+          if (mission) {
+            patchAutonomy.mission = mission;
+          }
+          if (goalsFile) {
+            patchAutonomy.goalsFile = goalsFile;
+          }
+          if (tasksFile) {
+            patchAutonomy.tasksFile = tasksFile;
+          }
+          if (logFile) {
+            patchAutonomy.logFile = logFile;
+          }
+          if (maxActions) {
+            patchAutonomy.maxActionsPerRun = maxActions;
+          }
+          if (dedupeWindowMinutes) {
+            patchAutonomy.dedupeWindowMinutes = dedupeWindowMinutes;
+          }
+          if (maxQueuedEvents) {
+            patchAutonomy.maxQueuedEvents = maxQueuedEvents;
+          }
+          if (dailyTokenBudget) {
+            patchAutonomy.dailyTokenBudget = dailyTokenBudget;
+          }
+          if (dailyCycleBudget) {
+            patchAutonomy.dailyCycleBudget = dailyCycleBudget;
+          }
+          if (maxConsecutiveErrors) {
+            patchAutonomy.maxConsecutiveErrors = maxConsecutiveErrors;
+          }
+          if (opts.autoPauseOnBudget === true || opts.autoPauseOnBudget === false) {
+            patchAutonomy.autoPauseOnBudgetExhausted = opts.autoPauseOnBudget;
+          }
+          if (opts.pause) {
+            patchAutonomy.paused = true;
+          }
+          if (opts.resume) {
+            patchAutonomy.paused = false;
+          }
+          if (Object.keys(patchAutonomy).length === 0) {
+            throw new Error("No tune fields provided.");
+          }
+          const res = await callGatewayFromCli("cron.update", opts, {
+            id,
+            patch: {
+              payload: {
+                kind: "agentTurn",
+                autonomy: patchAutonomy,
               },
             },
           });

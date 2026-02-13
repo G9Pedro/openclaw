@@ -17,6 +17,7 @@ const MAX_RECENT_EVENTS = 50;
 const MAX_RECENT_CYCLES = 50;
 const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
 const DEFAULT_MAX_QUEUED_EVENTS = 100;
+const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
 
 const writesByPath = new Map<string, Promise<void>>();
 
@@ -31,6 +32,8 @@ type PartialAutonomyState = Partial<
     | "maxActionsPerRun"
     | "dedupeWindowMs"
     | "maxQueuedEvents"
+    | "safety"
+    | "budget"
   >
 >;
 
@@ -47,6 +50,10 @@ function clampInt(value: number | undefined, min: number, max: number, fallback:
     return fallback;
   }
   return Math.max(min, Math.min(max, Math.floor(value as number)));
+}
+
+function resolveDayKey(nowMs: number) {
+  return new Date(nowMs).toISOString().slice(0, 10);
 }
 
 function resolveEventDedupeKey(event: AutonomyEvent) {
@@ -84,6 +91,8 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
     24 * 60 * 60_000,
     DEFAULT_DEDUPE_WINDOW_MS,
   );
+  const nowMs = Date.now();
+  const dayKey = resolveDayKey(nowMs);
   return {
     version: 1,
     agentId: normalizedAgentId,
@@ -97,6 +106,28 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
     maxActionsPerRun: clampInt(defaults?.maxActionsPerRun, 1, 20, 3),
     dedupeWindowMs,
     maxQueuedEvents: clampInt(defaults?.maxQueuedEvents, 1, 500, DEFAULT_MAX_QUEUED_EVENTS),
+    safety: {
+      dailyTokenBudget:
+        defaults?.safety?.dailyTokenBudget && Number.isFinite(defaults.safety.dailyTokenBudget)
+          ? Math.max(1, Math.floor(defaults.safety.dailyTokenBudget))
+          : undefined,
+      dailyCycleBudget:
+        defaults?.safety?.dailyCycleBudget && Number.isFinite(defaults.safety.dailyCycleBudget)
+          ? Math.max(1, Math.floor(defaults.safety.dailyCycleBudget))
+          : undefined,
+      maxConsecutiveErrors: clampInt(
+        defaults?.safety?.maxConsecutiveErrors,
+        1,
+        100,
+        DEFAULT_MAX_CONSECUTIVE_ERRORS,
+      ),
+      autoPauseOnBudgetExhausted: defaults?.safety?.autoPauseOnBudgetExhausted !== false,
+    },
+    budget: {
+      dayKey,
+      cyclesUsed: 0,
+      tokensUsed: 0,
+    },
     dedupe: {},
     goals: [],
     tasks: [],
@@ -107,6 +138,7 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
       ok: 0,
       error: 0,
       skipped: 0,
+      consecutiveErrors: 0,
     },
   };
 }
@@ -131,6 +163,21 @@ export async function hasAutonomyState(agentId: string) {
   } catch {
     return false;
   }
+}
+
+export async function resetAutonomyRuntime(agentId: string) {
+  const dir = resolveAutonomyAgentDir(agentId);
+  await fs.rm(dir, { recursive: true, force: true });
+}
+
+export function refreshAutonomyBudgetWindow(state: AutonomyState, nowMs = Date.now()) {
+  const dayKey = resolveDayKey(nowMs);
+  if (state.budget.dayKey === dayKey) {
+    return;
+  }
+  state.budget.dayKey = dayKey;
+  state.budget.cyclesUsed = 0;
+  state.budget.tokensUsed = 0;
 }
 
 export async function loadAutonomyState(params: {
@@ -165,6 +212,44 @@ export async function loadAutonomyState(params: {
       state.dedupeWindowMs,
     );
     state.maxQueuedEvents = clampInt(parsed.maxQueuedEvents, 1, 500, state.maxQueuedEvents);
+    if (parsed.safety && typeof parsed.safety === "object") {
+      const dailyTokenBudget = (parsed.safety as { dailyTokenBudget?: unknown }).dailyTokenBudget;
+      const dailyCycleBudget = (parsed.safety as { dailyCycleBudget?: unknown }).dailyCycleBudget;
+      const maxConsecutiveErrors = (parsed.safety as { maxConsecutiveErrors?: unknown })
+        .maxConsecutiveErrors;
+      const autoPauseOnBudgetExhausted = (parsed.safety as { autoPauseOnBudgetExhausted?: unknown })
+        .autoPauseOnBudgetExhausted;
+      state.safety.dailyTokenBudget =
+        typeof dailyTokenBudget === "number" && Number.isFinite(dailyTokenBudget)
+          ? Math.max(1, Math.floor(dailyTokenBudget))
+          : undefined;
+      state.safety.dailyCycleBudget =
+        typeof dailyCycleBudget === "number" && Number.isFinite(dailyCycleBudget)
+          ? Math.max(1, Math.floor(dailyCycleBudget))
+          : undefined;
+      state.safety.maxConsecutiveErrors = clampInt(
+        typeof maxConsecutiveErrors === "number" ? maxConsecutiveErrors : undefined,
+        1,
+        100,
+        state.safety.maxConsecutiveErrors,
+      );
+      state.safety.autoPauseOnBudgetExhausted = autoPauseOnBudgetExhausted !== false;
+    }
+    if (parsed.budget && typeof parsed.budget === "object") {
+      const dayKey = (parsed.budget as { dayKey?: unknown }).dayKey;
+      const cyclesUsed = (parsed.budget as { cyclesUsed?: unknown }).cyclesUsed;
+      const tokensUsed = (parsed.budget as { tokensUsed?: unknown }).tokensUsed;
+      state.budget.dayKey =
+        typeof dayKey === "string" && dayKey.trim() ? dayKey : state.budget.dayKey;
+      state.budget.cyclesUsed =
+        typeof cyclesUsed === "number" && Number.isFinite(cyclesUsed)
+          ? Math.max(0, Math.floor(cyclesUsed))
+          : 0;
+      state.budget.tokensUsed =
+        typeof tokensUsed === "number" && Number.isFinite(tokensUsed)
+          ? Math.max(0, Math.floor(tokensUsed))
+          : 0;
+    }
     state.dedupe = parsed.dedupe && typeof parsed.dedupe === "object" ? { ...parsed.dedupe } : {};
     state.goals = Array.isArray(parsed.goals) ? parsed.goals : [];
     state.tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
@@ -183,6 +268,9 @@ export async function loadAutonomyState(params: {
             skipped: Number.isFinite(parsed.metrics.skipped)
               ? Math.max(0, parsed.metrics.skipped)
               : 0,
+            consecutiveErrors: Number.isFinite(parsed.metrics.consecutiveErrors)
+              ? Math.max(0, parsed.metrics.consecutiveErrors)
+              : 0,
             lastCycleAt: Number.isFinite(parsed.metrics.lastCycleAt)
               ? parsed.metrics.lastCycleAt
               : undefined,
@@ -191,6 +279,7 @@ export async function loadAutonomyState(params: {
           }
         : state.metrics;
   }
+  refreshAutonomyBudgetWindow(state);
   return state;
 }
 
@@ -300,13 +389,20 @@ export async function drainAutonomyEvents(params: {
 }
 
 export function recordAutonomyCycle(state: AutonomyState, cycle: AutonomyCycleRecord) {
+  refreshAutonomyBudgetWindow(state, cycle.ts);
   state.metrics.cycles += 1;
   state.metrics.lastCycleAt = cycle.ts;
+  state.budget.cyclesUsed += 1;
+  if (cycle.tokenUsage && Number.isFinite(cycle.tokenUsage.total)) {
+    state.budget.tokensUsed += Math.max(0, Math.floor(cycle.tokenUsage.total));
+  }
   if (cycle.status === "ok") {
     state.metrics.ok += 1;
+    state.metrics.consecutiveErrors = 0;
   } else if (cycle.status === "error") {
     state.metrics.error += 1;
     state.metrics.lastError = cycle.error;
+    state.metrics.consecutiveErrors += 1;
   } else {
     state.metrics.skipped += 1;
   }
@@ -385,6 +481,9 @@ export async function appendAutonomyWorkspaceLog(params: {
   processedEvents: AutonomyEvent[];
   droppedDuplicates?: number;
   remainingEvents?: number;
+  budgetDayKey?: string;
+  budgetCyclesUsed?: number;
+  budgetTokensUsed?: number;
 }) {
   const logPath = resolveWorkspaceFile(params.workspaceDir, params.logFile);
   const lines = [
@@ -398,6 +497,11 @@ export async function appendAutonomyWorkspaceLog(params: {
       : undefined,
     typeof params.remainingEvents === "number"
       ? `Queued events remaining: ${params.remainingEvents}`
+      : undefined,
+    typeof params.budgetCyclesUsed === "number" && params.budgetDayKey
+      ? `Daily usage (${params.budgetDayKey}): cycles=${params.budgetCyclesUsed}${
+          typeof params.budgetTokensUsed === "number" ? ` tokens=${params.budgetTokensUsed}` : ""
+        }`
       : undefined,
     params.processedEvents.length > 0 ? "Event digest:" : undefined,
     ...params.processedEvents.map((event) => {

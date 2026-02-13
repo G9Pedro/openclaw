@@ -77,15 +77,94 @@ describe("autonomy runtime", () => {
       events: prepared.events,
       droppedDuplicates: prepared.droppedDuplicates,
       remainingEvents: prepared.remainingEvents,
+      usage: {
+        input: 200,
+        output: 100,
+        total: 300,
+      },
     });
 
     const reloaded = await store.loadAutonomyState({ agentId: "ops" });
     expect(reloaded.metrics.cycles).toBe(1);
     expect(reloaded.metrics.ok).toBe(1);
+    expect(reloaded.budget.tokensUsed).toBeGreaterThanOrEqual(300);
     expect(reloaded.recentEvents.length).toBeGreaterThan(0);
     const logPath = path.join(workspaceDir, reloaded.logFile);
     const logText = await fs.readFile(logPath, "utf-8");
     expect(logText).toContain("cycle done");
     expect(logText).toContain("email.received");
+  });
+
+  it("skips execution when daily cycle budget is exhausted", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.budget.cyclesUsed = 3;
+    state.safety.dailyCycleBudget = 3;
+    await store.saveAutonomyState(state);
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: {
+        enabled: true,
+      },
+    });
+    expect("skipped" in prepared && prepared.skipped).toBe(true);
+    if ("skipped" in prepared) {
+      expect(prepared.reason).toContain("daily cycle budget exhausted");
+      expect(prepared.state.paused).toBe(true);
+    }
+  });
+
+  it("auto-pauses when consecutive error threshold is reached", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: {
+        enabled: true,
+        maxConsecutiveErrors: 2,
+      },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected non-skipped prepare result");
+    }
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "error",
+      error: "boom-1",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      remainingEvents: prepared.remainingEvents,
+    });
+
+    const preparedSecond = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: {
+        enabled: true,
+        maxConsecutiveErrors: 2,
+      },
+    });
+    if ("skipped" in preparedSecond) {
+      throw new Error("expected non-skipped second prepare");
+    }
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: preparedSecond.state,
+      cycleStartedAt: preparedSecond.cycleStartedAt,
+      status: "error",
+      error: "boom-2",
+      events: preparedSecond.events,
+      droppedDuplicates: preparedSecond.droppedDuplicates,
+      remainingEvents: preparedSecond.remainingEvents,
+    });
+    const reloaded = await store.loadAutonomyState({ agentId: "ops" });
+    expect(reloaded.paused).toBe(true);
+    expect(reloaded.metrics.consecutiveErrors).toBeGreaterThanOrEqual(2);
   });
 });

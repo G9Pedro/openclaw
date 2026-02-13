@@ -99,6 +99,13 @@ export type AutonomousCycleContext = {
   blockedTaskCount: number;
   inProgressTaskCount: number;
   pendingTaskCount: number;
+  budget?: {
+    dayKey: string;
+    cyclesUsed: number;
+    tokensUsed: number;
+    dailyCycleBudget?: number;
+    dailyTokenBudget?: number;
+  };
 };
 
 export function buildAutonomousCyclePreamble(context: AutonomousCycleContext) {
@@ -112,6 +119,14 @@ export function buildAutonomousCyclePreamble(context: AutonomousCycleContext) {
     `Tasks pending: ${context.pendingTaskCount}`,
     "",
   ];
+  if (context.budget) {
+    const cycleBudget = context.budget.dailyCycleBudget ?? "unbounded";
+    const tokenBudget = context.budget.dailyTokenBudget ?? "unbounded";
+    lines.push(
+      `Budget (${context.budget.dayKey}): cycles ${context.budget.cyclesUsed}/${cycleBudget}, tokens ${context.budget.tokensUsed}/${tokenBudget}`,
+    );
+    lines.push("");
+  }
   if (context.queuedEvents.length > 0) {
     lines.push("Signals in this cycle:");
     for (const event of context.queuedEvents) {

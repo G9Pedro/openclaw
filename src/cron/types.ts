@@ -22,6 +22,10 @@ export type CronAutonomyConfig = {
   maxActionsPerRun?: number;
   dedupeWindowMinutes?: number;
   maxQueuedEvents?: number;
+  dailyTokenBudget?: number;
+  dailyCycleBudget?: number;
+  maxConsecutiveErrors?: number;
+  autoPauseOnBudgetExhausted?: boolean;
 };
 
 export type CronPayload =

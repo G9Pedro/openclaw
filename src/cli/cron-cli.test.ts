@@ -7,6 +7,41 @@ const callGatewayFromCli = vi.fn(async (method: string, _opts: unknown, params?:
   }
   return { ok: true, params };
 });
+const enqueueAutonomyEvent = vi.fn(async (_params: unknown) => ({
+  id: "evt-1",
+  source: "manual",
+  type: "manual.event",
+}));
+const loadAutonomyState = vi.fn(async () => ({
+  agentId: "ops",
+  paused: false,
+  mission: "test mission",
+  goalsFile: "AUTONOMY_GOALS.md",
+  tasksFile: "AUTONOMY_TASKS.md",
+  logFile: "AUTONOMY_LOG.md",
+  maxActionsPerRun: 3,
+  dedupeWindowMs: 3_600_000,
+  maxQueuedEvents: 100,
+  budget: {
+    dayKey: "2026-02-13",
+    cyclesUsed: 2,
+    tokensUsed: 1200,
+  },
+  safety: {
+    dailyCycleBudget: 30,
+    dailyTokenBudget: 100_000,
+    maxConsecutiveErrors: 5,
+    autoPauseOnBudgetExhausted: true,
+  },
+  metrics: {
+    cycles: 2,
+    ok: 2,
+    error: 0,
+    skipped: 0,
+    consecutiveErrors: 0,
+  },
+}));
+const resetAutonomyRuntime = vi.fn(async (_agentId: string) => undefined);
 
 vi.mock("./gateway-rpc.js", async () => {
   const actual = await vi.importActual<typeof import("./gateway-rpc.js")>("./gateway-rpc.js");
@@ -25,6 +60,12 @@ vi.mock("../runtime.js", () => ({
       throw new Error(`__exit__:${code}`);
     },
   },
+}));
+
+vi.mock("../autonomy/store.js", () => ({
+  enqueueAutonomyEvent: (params: unknown) => enqueueAutonomyEvent(params),
+  loadAutonomyState: (params: unknown) => loadAutonomyState(params),
+  resetAutonomyRuntime: (agentId: string) => resetAutonomyRuntime(agentId),
 }));
 
 describe("cron cli", () => {
@@ -398,6 +439,8 @@ describe("cron cli", () => {
           paused?: boolean;
           mission?: string;
           maxActionsPerRun?: number;
+          maxConsecutiveErrors?: number;
+          autoPauseOnBudgetExhausted?: boolean;
         };
       };
       isolation?: { postToMainPrefix?: string };
@@ -412,6 +455,8 @@ describe("cron cli", () => {
     expect(params?.payload?.autonomy?.paused).toBe(false);
     expect(params?.payload?.autonomy?.mission).toContain("Ship high-impact outcomes continuously");
     expect(params?.payload?.autonomy?.maxActionsPerRun).toBe(3);
+    expect(params?.payload?.autonomy?.maxConsecutiveErrors).toBe(5);
+    expect(params?.payload?.autonomy?.autoPauseOnBudgetExhausted).toBe(true);
     expect(params?.isolation?.postToMainPrefix).toBe("Autonomy");
   });
 
@@ -439,6 +484,13 @@ describe("cron cli", () => {
         "90",
         "--max-actions",
         "7",
+        "--daily-token-budget",
+        "120000",
+        "--daily-cycle-budget",
+        "50",
+        "--max-consecutive-errors",
+        "9",
+        "--no-auto-pause-on-budget",
         "--goals-file",
         "GOALS.md",
         "--tasks-file",
@@ -475,6 +527,10 @@ describe("cron cli", () => {
           maxActionsPerRun?: number;
           dedupeWindowMinutes?: number;
           maxQueuedEvents?: number;
+          dailyTokenBudget?: number;
+          dailyCycleBudget?: number;
+          maxConsecutiveErrors?: number;
+          autoPauseOnBudgetExhausted?: boolean;
         };
       };
     };
@@ -495,6 +551,10 @@ describe("cron cli", () => {
     expect(params?.payload?.autonomy?.maxActionsPerRun).toBe(7);
     expect(params?.payload?.autonomy?.dedupeWindowMinutes).toBe(60);
     expect(params?.payload?.autonomy?.maxQueuedEvents).toBe(100);
+    expect(params?.payload?.autonomy?.dailyTokenBudget).toBe(120000);
+    expect(params?.payload?.autonomy?.dailyCycleBudget).toBe(50);
+    expect(params?.payload?.autonomy?.maxConsecutiveErrors).toBe(9);
+    expect(params?.payload?.autonomy?.autoPauseOnBudgetExhausted).toBe(false);
   });
 
   it("pauses and resumes autonomous jobs via cron.update", async () => {
@@ -551,5 +611,104 @@ describe("cron cli", () => {
     await program.parseAsync(["cron", "autonomous-status", "--json"], { from: "user" });
     const listCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.list");
     expect(listCall?.[2]).toEqual({ includeDisabled: true });
+  });
+
+  it("inspects and resets autonomy runtime state", async () => {
+    callGatewayFromCli.mockClear();
+    loadAutonomyState.mockClear();
+    resetAutonomyRuntime.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(["cron", "autonomous-inspect", "--agent", " Ops ", "--json"], {
+      from: "user",
+    });
+    expect(loadAutonomyState).toHaveBeenCalledWith({ agentId: "ops" });
+
+    await program.parseAsync(["cron", "autonomous-reset", "--agent", " Ops "], { from: "user" });
+    expect(resetAutonomyRuntime).toHaveBeenCalledWith("ops");
+  });
+
+  it("tunes autonomy fields on an existing job", async () => {
+    callGatewayFromCli.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(
+      [
+        "cron",
+        "autonomous-tune",
+        "job-1",
+        "--mission",
+        "new mission",
+        "--max-actions",
+        "6",
+        "--daily-token-budget",
+        "200000",
+        "--pause",
+      ],
+      { from: "user" },
+    );
+    const updateCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.update");
+    const patch = updateCall?.[2] as {
+      patch?: {
+        payload?: {
+          kind?: string;
+          autonomy?: {
+            mission?: string;
+            maxActionsPerRun?: number;
+            dailyTokenBudget?: number;
+            paused?: boolean;
+          };
+        };
+      };
+    };
+    expect(patch?.patch?.payload?.kind).toBe("agentTurn");
+    expect(patch?.patch?.payload?.autonomy?.mission).toBe("new mission");
+    expect(patch?.patch?.payload?.autonomy?.maxActionsPerRun).toBe(6);
+    expect(patch?.patch?.payload?.autonomy?.dailyTokenBudget).toBe(200000);
+    expect(patch?.patch?.payload?.autonomy?.paused).toBe(true);
+  });
+
+  it("injects autonomy events from cli", async () => {
+    callGatewayFromCli.mockClear();
+    enqueueAutonomyEvent.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(
+      [
+        "cron",
+        "autonomous-event",
+        "--agent",
+        "ops",
+        "--source",
+        "webhook",
+        "--type",
+        "hook.received",
+        "--dedupe-key",
+        "evt-123",
+        "--payload",
+        '{"k":"v"}',
+      ],
+      { from: "user" },
+    );
+    expect(enqueueAutonomyEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "ops",
+        source: "webhook",
+        type: "hook.received",
+        dedupeKey: "evt-123",
+      }),
+    );
   });
 });

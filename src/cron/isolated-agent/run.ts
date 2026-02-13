@@ -265,6 +265,13 @@ export async function runCronIsolatedAgentTurn(params: {
     status: "ok" | "error" | "skipped";
     summary?: string;
     error?: string;
+    usage?: {
+      input?: number;
+      output?: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      total?: number;
+    };
   }) => {
     if (!autonomyRuntime || "skipped" in autonomyRuntime) {
       return;
@@ -279,6 +286,7 @@ export async function runCronIsolatedAgentTurn(params: {
       events: autonomyRuntime.events,
       droppedDuplicates: autonomyRuntime.droppedDuplicates,
       remainingEvents: autonomyRuntime.remainingEvents,
+      usage: params.usage,
     });
   };
 
@@ -448,9 +456,10 @@ export async function runCronIsolatedAgentTurn(params: {
 
   const payloads = runResult.payloads ?? [];
 
+  const cycleUsage = runResult.meta.agentMeta?.usage;
+
   // Update token+model fields in the session store.
   {
-    const usage = runResult.meta.agentMeta?.usage;
     const modelUsed = runResult.meta.agentMeta?.model ?? fallbackModel ?? model;
     const providerUsed = runResult.meta.agentMeta?.provider ?? fallbackProvider ?? provider;
     const contextTokens =
@@ -465,14 +474,14 @@ export async function runCronIsolatedAgentTurn(params: {
         setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
       }
     }
-    if (hasNonzeroUsage(usage)) {
-      const input = usage.input ?? 0;
-      const output = usage.output ?? 0;
-      const promptTokens = input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+    if (hasNonzeroUsage(cycleUsage)) {
+      const input = cycleUsage.input ?? 0;
+      const output = cycleUsage.output ?? 0;
+      const promptTokens = input + (cycleUsage.cacheRead ?? 0) + (cycleUsage.cacheWrite ?? 0);
       cronSession.sessionEntry.inputTokens = input;
       cronSession.sessionEntry.outputTokens = output;
       cronSession.sessionEntry.totalTokens =
-        promptTokens > 0 ? promptTokens : (usage.total ?? input);
+        promptTokens > 0 ? promptTokens : (cycleUsage.total ?? input);
     }
     cronSession.store[agentSessionKey] = cronSession.sessionEntry;
     await updateSessionStore(cronSession.storePath, (store) => {
@@ -548,6 +557,7 @@ export async function runCronIsolatedAgentTurn(params: {
       await completeAutonomyCycle({
         status: "ok",
         summary,
+        usage: cycleUsage,
       });
       return { status: "ok", summary, outputText };
     }
@@ -556,6 +566,7 @@ export async function runCronIsolatedAgentTurn(params: {
   await completeAutonomyCycle({
     status: "ok",
     summary,
+    usage: cycleUsage,
   });
   return { status: "ok", summary, outputText };
 }
