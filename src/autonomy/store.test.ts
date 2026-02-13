@@ -130,6 +130,48 @@ describe("autonomy store", () => {
     expect(drained.remaining).toBeGreaterThan(0);
   });
 
+  it("caps state collections to avoid unbounded growth", async () => {
+    const store = await import("./store.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    const oversized = {
+      ...state,
+      dedupe: Object.fromEntries(
+        Array.from({ length: 6000 }, (_, index) => [`k-${index}`, 1_000_000 + index]),
+      ),
+      goals: Array.from({ length: 600 }, (_, index) => ({
+        id: `g-${index}`,
+        title: `goal-${index}`,
+        status: "active",
+        impact: 5,
+        urgency: 5,
+        confidence: 5,
+        createdAt: 1_000 + index,
+        updatedAt: 2_000 + index,
+      })),
+      tasks: Array.from({ length: 2500 }, (_, index) => ({
+        id: `t-${index}`,
+        title: `task-${index}`,
+        status: "pending",
+        priority: "medium",
+        dependencies: [],
+        owner: "autonomy",
+        createdAt: 1_000 + index,
+        updatedAt: 2_000 + index,
+      })),
+    };
+    await fs.writeFile(store.resolveAutonomyStatePath("ops"), JSON.stringify(oversized), "utf-8");
+    await fs.writeFile(
+      store.resolveAutonomyStateBackupPath("ops"),
+      JSON.stringify(oversized),
+      "utf-8",
+    );
+
+    const loaded = await store.loadAutonomyState({ agentId: "ops" });
+    expect(Object.keys(loaded.dedupe).length).toBeLessThanOrEqual(5000);
+    expect(loaded.goals.length).toBeLessThanOrEqual(500);
+    expect(loaded.tasks.length).toBeLessThanOrEqual(2000);
+  });
+
   it("records cycles and writes markdown run log", async () => {
     const store = await import("./store.js");
     const state = await store.loadAutonomyState({ agentId: "ops" });

@@ -18,6 +18,9 @@ const LOCK_FILENAME = "run.lock";
 const MAX_RECENT_EVENTS = 50;
 const MAX_RECENT_CYCLES = 50;
 const MAX_EVENT_QUEUE_LINES = 5000;
+const MAX_DEDUPE_ENTRIES = 5000;
+const MAX_STORED_GOALS = 500;
+const MAX_STORED_TASKS = 2000;
 const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
 const DEFAULT_MAX_QUEUED_EVENTS = 100;
 const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
@@ -98,6 +101,18 @@ function pruneDedupeMap(state: AutonomyState, nowMs: number) {
   const minTs = nowMs - Math.max(state.dedupeWindowMs * 3, state.dedupeWindowMs);
   for (const [key, ts] of Object.entries(state.dedupe)) {
     if (!Number.isFinite(ts) || ts < minTs) {
+      delete state.dedupe[key];
+    }
+  }
+  const entries = Object.entries(state.dedupe)
+    .filter(([, ts]) => Number.isFinite(ts))
+    .sort((a, b) => (b[1] as number) - (a[1] as number));
+  if (entries.length <= MAX_DEDUPE_ENTRIES) {
+    return;
+  }
+  const allowed = new Set(entries.slice(0, MAX_DEDUPE_ENTRIES).map(([key]) => key));
+  for (const key of Object.keys(state.dedupe)) {
+    if (!allowed.has(key)) {
       delete state.dedupe[key];
     }
   }
@@ -376,8 +391,8 @@ export async function loadAutonomyState(params: {
     }
     state.taskSignals =
       parsed.taskSignals && typeof parsed.taskSignals === "object" ? { ...parsed.taskSignals } : {};
-    state.goals = Array.isArray(parsed.goals) ? parsed.goals : [];
-    state.tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    state.goals = Array.isArray(parsed.goals) ? parsed.goals.slice(-MAX_STORED_GOALS) : [];
+    state.tasks = Array.isArray(parsed.tasks) ? parsed.tasks.slice(-MAX_STORED_TASKS) : [];
     state.recentEvents = Array.isArray(parsed.recentEvents)
       ? parsed.recentEvents.slice(-MAX_RECENT_EVENTS)
       : [];
@@ -410,6 +425,7 @@ export async function loadAutonomyState(params: {
   } else if (!state.pauseReason) {
     state.pauseReason = "manual";
   }
+  pruneDedupeMap(state, Date.now());
   refreshAutonomyBudgetWindow(state);
   if (!parsed) {
     await saveAutonomyState(state);
