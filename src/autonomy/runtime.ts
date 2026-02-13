@@ -37,6 +37,8 @@ import {
   transitionAugmentationStage,
 } from "./runtime.phase-machine.js";
 import { planSkillCandidates } from "./skill-forge/planner.js";
+import { synthesizeSkillCandidates } from "./skill-forge/synthesizer.js";
+import { verifySkillCandidates } from "./skill-forge/verify.js";
 import {
   applyAutonomyPause,
   appendAutonomyWorkspaceLog,
@@ -270,6 +272,7 @@ async function processAugmentationCycle(params: {
   state: AutonomyState;
   nowMs: number;
   events: AutonomyEvent[];
+  workspaceDir: string;
 }) {
   const correlationId = `cycle-${params.nowMs}`;
   const augmentationEvents: AutonomyEvent[] = [];
@@ -329,6 +332,61 @@ async function processAugmentationCycle(params: {
       },
       ts: params.nowMs,
     });
+  }
+
+  const stageBeforeActions = params.state.augmentation.stage;
+  if (stageBeforeActions === "synthesize") {
+    const synthesized = await synthesizeSkillCandidates({
+      workspaceDir: params.workspaceDir,
+      candidates: params.state.augmentation.candidates,
+    });
+    if (synthesized.synthesized > 0) {
+      params.state.augmentation.candidates = synthesized.candidates;
+      const candidatesEvent = createCandidatesUpdatedEvent({
+        nowMs: params.nowMs,
+        generated: synthesized.synthesized,
+        totalCandidates: params.state.augmentation.candidates.length,
+      });
+      augmentationEvents.push(candidatesEvent);
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId,
+        eventType: "candidate_update",
+        stage: params.state.augmentation.stage,
+        actor: "skill-synthesizer",
+        summary: `synthesized ${synthesized.synthesized} skill file(s)`,
+        evidence: {
+          synthesized: synthesized.synthesized,
+        },
+        ts: params.nowMs,
+      });
+    }
+  }
+
+  if (stageBeforeActions === "verify") {
+    const verified = await verifySkillCandidates({
+      workspaceDir: params.workspaceDir,
+      candidates: params.state.augmentation.candidates,
+    });
+    if (verified.reports.length > 0) {
+      params.state.augmentation.candidates = verified.candidates;
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId,
+        eventType: "candidate_update",
+        stage: params.state.augmentation.stage,
+        actor: "skill-verifier",
+        summary: `verified ${verified.reports.length} candidate(s)`,
+        evidence: {
+          reports: verified.reports.map((report) => ({
+            candidateId: report.candidateId,
+            ok: report.ok,
+            failures: report.failures,
+          })),
+        },
+        ts: params.nowMs,
+      });
+    }
   }
 
   const nextStage = resolveNextAugmentationStage(params.state);
@@ -683,6 +741,7 @@ export async function prepareAutonomyRuntime(params: {
       state,
       nowMs,
       events: runtimeEvents,
+      workspaceDir: params.workspaceDir,
     });
     const events = [...runtimeEvents, ...augmentationEvents];
     recordAutonomyEvents(state, events);

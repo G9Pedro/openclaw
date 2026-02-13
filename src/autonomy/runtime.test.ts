@@ -543,4 +543,86 @@ describe("autonomy runtime", () => {
       lockToken: prepared.lockToken,
     });
   });
+
+  it("synthesizes and verifies generated skills through augmentation stages", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.augmentation.stage = "synthesize";
+    state.augmentation.candidates = [
+      {
+        id: "candidate-1",
+        sourceGapId: "gap-1",
+        name: "autonomy-stage-skill",
+        intent: "exercise skill forge",
+        status: "candidate",
+        priority: 100,
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+        safety: {
+          executionClass: "reversible_write",
+          constraints: ["must be reversible and observable"],
+        },
+        tests: ["unit: addresses gap gap-1"],
+      },
+    ];
+    await store.saveAutonomyState(state);
+
+    const synthesized = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in synthesized) {
+      throw new Error("expected synthesized run to execute");
+    }
+    const generatedPath = path.join(
+      workspaceDir,
+      "skills",
+      "autonomy-generated",
+      "autonomy-stage-skill.md",
+    );
+    const generatedContent = await fs.readFile(generatedPath, "utf-8");
+    expect(generatedContent).toContain("## Safety constraints");
+    expect(synthesized.state.augmentation.candidates[0]?.status).toBe("planned");
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: synthesized.state,
+      cycleStartedAt: synthesized.cycleStartedAt,
+      status: "ok",
+      events: synthesized.events,
+      droppedDuplicates: synthesized.droppedDuplicates,
+      droppedInvalid: synthesized.droppedInvalid,
+      droppedOverflow: synthesized.droppedOverflow,
+      remainingEvents: synthesized.remainingEvents,
+      lockToken: synthesized.lockToken,
+    });
+
+    const reloaded = await store.loadAutonomyState({ agentId: "ops" });
+    reloaded.augmentation.stage = "verify";
+    await store.saveAutonomyState(reloaded);
+    const verified = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in verified) {
+      throw new Error("expected verify run to execute");
+    }
+    expect(
+      verified.state.augmentation.candidates.some((candidate) => candidate.status === "verified"),
+    ).toBe(true);
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: verified.state,
+      cycleStartedAt: verified.cycleStartedAt,
+      status: "ok",
+      events: verified.events,
+      droppedDuplicates: verified.droppedDuplicates,
+      droppedInvalid: verified.droppedInvalid,
+      droppedOverflow: verified.droppedOverflow,
+      remainingEvents: verified.remainingEvents,
+      lockToken: verified.lockToken,
+    });
+  });
 });
