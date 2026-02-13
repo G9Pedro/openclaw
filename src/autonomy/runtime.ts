@@ -84,6 +84,10 @@ function normalizeOptionalPositiveInt(value: number | undefined) {
   return Math.max(1, Math.floor(value as number));
 }
 
+function resolveDayKey(nowMs: number) {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
 function buildSyntheticAutonomyEvents(params: {
   state: AutonomyState;
   nowMs: number;
@@ -262,12 +266,16 @@ export async function prepareAutonomyRuntime(params: {
     }
   }
   const budgetRolled = refreshAutonomyBudgetWindow(state, nowMs);
+  const sameDayBudgetFresh =
+    state.budget.dayKey === resolveDayKey(nowMs) &&
+    state.budget.cyclesUsed === 0 &&
+    state.budget.tokensUsed === 0;
 
   let resumedReason: string | undefined;
   if (
     state.paused &&
     state.pauseReason === "budget" &&
-    budgetRolled &&
+    (budgetRolled || sameDayBudgetFresh) &&
     state.safety.autoResumeOnNewDayBudgetPause
   ) {
     clearAutonomyPause(state);
