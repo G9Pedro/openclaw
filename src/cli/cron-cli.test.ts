@@ -372,4 +372,107 @@ describe("cron cli", () => {
     expect(patch?.patch?.payload?.message).toBe("Updated message");
     expect(patch?.patch?.payload?.bestEffortDeliver).toBe(false);
   });
+
+  it("creates autonomous cron job with coordination and task primitives", async () => {
+    callGatewayFromCli.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(
+      ["cron", "autonomous", "--mission", "Ship high-impact outcomes continuously"],
+      { from: "user" },
+    );
+
+    const addCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.add");
+    const params = addCall?.[2] as {
+      sessionTarget?: string;
+      schedule?: { kind?: string; everyMs?: number };
+      payload?: { kind?: string; message?: string };
+      isolation?: { postToMainPrefix?: string };
+    };
+
+    expect(params?.sessionTarget).toBe("isolated");
+    expect(params?.schedule?.kind).toBe("every");
+    expect(params?.schedule?.everyMs).toBe(600_000);
+    expect(params?.payload?.kind).toBe("agentTurn");
+    expect(params?.payload?.message).toContain("Coordination primitives:");
+    expect(params?.payload?.message).toContain("Task primitives (state machine):");
+    expect(params?.payload?.message).toContain("Ship high-impact outcomes continuously");
+    expect(params?.isolation?.postToMainPrefix).toBe("Autonomy");
+  });
+
+  it("supports autonomous command overrides for delivery and persistence paths", async () => {
+    callGatewayFromCli.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(
+      [
+        "cron",
+        "autonomous",
+        "--every",
+        "5m",
+        "--agent",
+        " Ops ",
+        "--model",
+        " opus ",
+        "--thinking",
+        " low ",
+        "--timeout-seconds",
+        "90",
+        "--max-actions",
+        "7",
+        "--goals-file",
+        "GOALS.md",
+        "--tasks-file",
+        "TASKS.md",
+        "--log-file",
+        "LOG.md",
+        "--deliver",
+        "--channel",
+        "telegram",
+        "--to",
+        "19098680",
+        "--best-effort-deliver",
+      ],
+      { from: "user" },
+    );
+
+    const addCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.add");
+    const params = addCall?.[2] as {
+      agentId?: string;
+      schedule?: { kind?: string; everyMs?: number };
+      payload?: {
+        model?: string;
+        thinking?: string;
+        timeoutSeconds?: number;
+        deliver?: boolean;
+        channel?: string;
+        to?: string;
+        bestEffortDeliver?: boolean;
+        message?: string;
+      };
+    };
+
+    expect(params?.agentId).toBe("ops");
+    expect(params?.schedule?.kind).toBe("every");
+    expect(params?.schedule?.everyMs).toBe(300_000);
+    expect(params?.payload?.model).toBe("opus");
+    expect(params?.payload?.thinking).toBe("low");
+    expect(params?.payload?.timeoutSeconds).toBe(90);
+    expect(params?.payload?.deliver).toBe(true);
+    expect(params?.payload?.channel).toBe("telegram");
+    expect(params?.payload?.to).toBe("19098680");
+    expect(params?.payload?.bestEffortDeliver).toBe(true);
+    expect(params?.payload?.message).toContain("Goals file: GOALS.md");
+    expect(params?.payload?.message).toContain("Tasks file: TASKS.md");
+    expect(params?.payload?.message).toContain("Execution log: LOG.md");
+    expect(params?.payload?.message).toContain("Execute at most 7 meaningful actions this run.");
+  });
 });

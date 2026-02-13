@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { formatDocsLink } from "../../terminal/links.js";
 import { theme } from "../../terminal/theme.js";
+import { registerCronAutonomousCommand } from "./register.cron-autonomous.js";
 import {
   registerCronAddCommand,
   registerCronListCommand,
@@ -22,6 +23,7 @@ export function registerCronCli(program: Command) {
   registerCronStatusCommand(cron);
   registerCronListCommand(cron);
   registerCronAddCommand(cron);
+  registerCronAutonomousCommand(cron);
   registerCronSimpleCommands(cron);
   registerCronEditCommand(cron);
 }
