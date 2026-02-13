@@ -16,12 +16,14 @@ import {
   normalizeAutonomyText,
 } from "../agents/autonomy-primitives.js";
 import { emitDiagnosticEvent } from "../infra/diagnostic-events.js";
+import { evaluateCanaryHealth } from "./canary/manager.js";
 import { upsertGapRegistry } from "./discovery/gap-registry.js";
 import { normalizeAutonomySignals } from "./discovery/signal-normalizer.js";
 import {
   createAugmentationPhaseEnterEvent,
   createAugmentationPhaseExitEvent,
   createAugmentationPolicyDeniedEvent,
+  createCanaryEvaluationEvent,
   createCandidatesUpdatedEvent,
   createDiscoveryUpdatedEvent,
 } from "./events.js";
@@ -383,6 +385,77 @@ async function processAugmentationCycle(params: {
             ok: report.ok,
             failures: report.failures,
           })),
+        },
+        ts: params.nowMs,
+      });
+    }
+  }
+
+  if (stageBeforeActions === "canary") {
+    const recentCycles = params.state.recentCycles.slice(-5);
+    const actionable = recentCycles.filter((cycle) => cycle.status !== "skipped");
+    const errorRate =
+      actionable.length > 0
+        ? actionable.filter((cycle) => cycle.status === "error").length / actionable.length
+        : 0;
+    const latencies = actionable
+      .map((cycle) => cycle.durationMs)
+      .filter((duration): duration is number => Number.isFinite(duration))
+      .toSorted((a, b) => a - b);
+    const latencyP95Ms =
+      latencies.length > 0
+        ? latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * 0.95))]
+        : 0;
+    const baselineLatencyP95Ms =
+      latencies.length > 0 ? latencies[Math.floor((latencies.length - 1) / 2)] : 0;
+    const canary = evaluateCanaryHealth({
+      errorRate,
+      maxErrorRate: 0.05,
+      latencyP95Ms,
+      baselineLatencyP95Ms,
+      maxLatencyRegressionPct: 50,
+    });
+    augmentationEvents.push(
+      createCanaryEvaluationEvent({
+        nowMs: params.nowMs,
+        status: canary.status,
+        reason: canary.reason,
+        errorRate,
+        latencyP95Ms,
+      }),
+    );
+    if (canary.shouldRollback) {
+      params.state.augmentation.candidates = params.state.augmentation.candidates.map((candidate) =>
+        candidate.status === "verified"
+          ? { ...candidate, status: "rejected", updatedAt: params.nowMs }
+          : candidate,
+      );
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId,
+        eventType: "rollback",
+        stage: params.state.augmentation.stage,
+        actor: "canary-manager",
+        summary: canary.reason,
+        evidence: {
+          errorRate,
+          latencyP95Ms,
+          baselineLatencyP95Ms,
+        },
+        ts: params.nowMs,
+      });
+    } else {
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId,
+        eventType: "promotion",
+        stage: params.state.augmentation.stage,
+        actor: "canary-manager",
+        summary: canary.reason,
+        evidence: {
+          errorRate,
+          latencyP95Ms,
+          baselineLatencyP95Ms,
         },
         ts: params.nowMs,
       });

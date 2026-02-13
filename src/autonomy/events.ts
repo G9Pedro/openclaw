@@ -5,7 +5,8 @@ export type AutonomyAugmentationEventType =
   | "autonomy.augmentation.phase.exit"
   | "autonomy.augmentation.policy.denied"
   | "autonomy.augmentation.discovery.updated"
-  | "autonomy.augmentation.candidates.updated";
+  | "autonomy.augmentation.candidates.updated"
+  | "autonomy.augmentation.canary.evaluated";
 
 export function createAugmentationPhaseEnterEvent(params: {
   stage: AutonomyAugmentationStage;
@@ -95,6 +96,28 @@ export function createCandidatesUpdatedEvent(params: {
     payload: {
       generated: params.generated,
       totalCandidates: params.totalCandidates,
+    },
+  };
+}
+
+export function createCanaryEvaluationEvent(params: {
+  nowMs: number;
+  status: "healthy" | "regressed";
+  reason: string;
+  errorRate: number;
+  latencyP95Ms: number;
+}): AutonomyEvent {
+  return {
+    id: `augmentation-canary-${params.status}-${params.nowMs}`,
+    source: "manual",
+    type: "autonomy.augmentation.canary.evaluated",
+    ts: params.nowMs,
+    dedupeKey: `autonomy.augmentation.canary.evaluated:${Math.floor(params.nowMs / 60_000)}`,
+    payload: {
+      status: params.status,
+      reason: params.reason,
+      errorRate: params.errorRate,
+      latencyP95Ms: params.latencyP95Ms,
     },
   };
 }
