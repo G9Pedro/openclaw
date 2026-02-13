@@ -21,21 +21,18 @@ const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
 
 const writesByPath = new Map<string, Promise<void>>();
 
-type PartialAutonomyState = Partial<
-  Pick<
-    AutonomyState,
-    | "mission"
-    | "paused"
-    | "goalsFile"
-    | "tasksFile"
-    | "logFile"
-    | "maxActionsPerRun"
-    | "dedupeWindowMs"
-    | "maxQueuedEvents"
-    | "safety"
-    | "budget"
-  >
->;
+type PartialAutonomyState = {
+  mission?: AutonomyState["mission"];
+  paused?: AutonomyState["paused"];
+  goalsFile?: AutonomyState["goalsFile"];
+  tasksFile?: AutonomyState["tasksFile"];
+  logFile?: AutonomyState["logFile"];
+  maxActionsPerRun?: AutonomyState["maxActionsPerRun"];
+  dedupeWindowMs?: AutonomyState["dedupeWindowMs"];
+  maxQueuedEvents?: AutonomyState["maxQueuedEvents"];
+  safety?: Partial<AutonomyState["safety"]>;
+  budget?: Partial<AutonomyState["budget"]>;
+};
 
 function normalizeOptionalString(value: unknown) {
   if (typeof value !== "string") {

@@ -118,8 +118,12 @@ export async function prepareAutonomyRuntime(params: {
     state.maxQueuedEvents,
   );
   if (autonomyCfg) {
-    state.safety.dailyTokenBudget = normalizeOptionalPositiveInt(autonomyCfg.dailyTokenBudget);
-    state.safety.dailyCycleBudget = normalizeOptionalPositiveInt(autonomyCfg.dailyCycleBudget);
+    if (autonomyCfg.dailyTokenBudget !== undefined) {
+      state.safety.dailyTokenBudget = normalizeOptionalPositiveInt(autonomyCfg.dailyTokenBudget);
+    }
+    if (autonomyCfg.dailyCycleBudget !== undefined) {
+      state.safety.dailyCycleBudget = normalizeOptionalPositiveInt(autonomyCfg.dailyCycleBudget);
+    }
     if (Number.isFinite(autonomyCfg.maxConsecutiveErrors)) {
       state.safety.maxConsecutiveErrors = Math.max(
         1,
