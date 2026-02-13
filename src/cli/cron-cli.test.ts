@@ -12,6 +12,18 @@ const enqueueAutonomyEvent = vi.fn(async (_params: unknown) => ({
   source: "manual",
   type: "manual.event",
 }));
+const readAutonomyLedgerEntries = vi.fn(async () => [
+  {
+    id: "ledger-1",
+    agentId: "ops",
+    ts: 1_700_000_000_000,
+    correlationId: "cycle-1",
+    eventType: "phase_enter",
+    stage: "discover",
+    actor: "phase-machine",
+    summary: "entered discover",
+  },
+]);
 const loadAutonomyState = vi.fn(async () => ({
   agentId: "ops",
   paused: false,
@@ -27,6 +39,18 @@ const loadAutonomyState = vi.fn(async () => ({
   review: {
     lastDailyReviewDayKey: "2026-02-12",
     lastWeeklyReviewKey: "2026-W06",
+  },
+  augmentation: {
+    stage: "discover",
+    stageEnteredAt: 1_700_000_000_000,
+    lastTransitionAt: 1_700_000_000_000,
+    lastTransitionReason: "boot",
+    phaseRunCount: 4,
+    policyVersion: "2026-02-13",
+    gaps: [],
+    candidates: [],
+    activeExperiments: [],
+    transitions: [],
   },
   taskSignals: {},
   dedupe: {},
@@ -83,6 +107,10 @@ vi.mock("../autonomy/store.js", () => ({
   enqueueAutonomyEvent: (params: unknown) => enqueueAutonomyEvent(params),
   loadAutonomyState: (params: unknown) => loadAutonomyState(params),
   resetAutonomyRuntime: (agentId: string) => resetAutonomyRuntime(agentId),
+}));
+
+vi.mock("../autonomy/ledger/store.js", () => ({
+  readAutonomyLedgerEntries: (params: unknown) => readAutonomyLedgerEntries(params),
 }));
 
 describe("cron cli", () => {
@@ -688,6 +716,26 @@ describe("cron cli", () => {
       from: "user",
     });
     expect(loadAutonomyState).toHaveBeenCalledWith({ agentId: "ops" });
+  });
+
+  it("lists augmentation ledger entries", async () => {
+    readAutonomyLedgerEntries.mockClear();
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(
+      ["cron", "autonomous-ledger", "--agent", " Ops ", "--limit", "10", "--offset", "0", "--json"],
+      {
+        from: "user",
+      },
+    );
+    expect(readAutonomyLedgerEntries).toHaveBeenCalledWith({
+      agentId: "ops",
+      limit: 10,
+      offset: 0,
+    });
   });
 
   it("tunes autonomy fields on an existing job", async () => {

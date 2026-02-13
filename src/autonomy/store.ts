@@ -21,11 +21,16 @@ const MAX_EVENT_QUEUE_LINES = 5000;
 const MAX_DEDUPE_ENTRIES = 5000;
 const MAX_STORED_GOALS = 500;
 const MAX_STORED_TASKS = 2000;
+const MAX_AUGMENTATION_GAPS = 200;
+const MAX_AUGMENTATION_CANDIDATES = 250;
+const MAX_AUGMENTATION_EXPERIMENTS = 100;
+const MAX_AUGMENTATION_TRANSITIONS = 200;
 const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
 const DEFAULT_MAX_QUEUED_EVENTS = 100;
 const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
 const DEFAULT_ERROR_PAUSE_MINUTES = 240;
 const DEFAULT_STALE_TASK_HOURS = 24;
+const DEFAULT_AUGMENTATION_POLICY_VERSION = "2026-02-13";
 
 const writesByPath = new Map<string, Promise<void>>();
 
@@ -43,8 +48,28 @@ type PartialAutonomyState = {
   safety?: Partial<AutonomyState["safety"]>;
   budget?: Partial<AutonomyState["budget"]>;
   review?: Partial<AutonomyState["review"]>;
+  augmentation?: Partial<AutonomyState["augmentation"]>;
   taskSignals?: AutonomyState["taskSignals"];
 };
+
+const AUGMENTATION_STAGES: AutonomyState["augmentation"]["stage"][] = [
+  "discover",
+  "design",
+  "synthesize",
+  "verify",
+  "canary",
+  "promote",
+  "observe",
+  "learn",
+  "retire",
+];
+
+function isAugmentationStage(value: unknown): value is AutonomyState["augmentation"]["stage"] {
+  return (
+    typeof value === "string" &&
+    AUGMENTATION_STAGES.includes(value as AutonomyState["augmentation"]["stage"])
+  );
+}
 
 function normalizeOptionalString(value: unknown) {
   if (typeof value !== "string") {
@@ -191,6 +216,40 @@ function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): Au
     review: {
       lastDailyReviewDayKey: defaults?.review?.lastDailyReviewDayKey,
       lastWeeklyReviewKey: defaults?.review?.lastWeeklyReviewKey,
+    },
+    augmentation: {
+      stage: isAugmentationStage(defaults?.augmentation?.stage)
+        ? defaults.augmentation.stage
+        : "discover",
+      stageEnteredAt:
+        typeof defaults?.augmentation?.stageEnteredAt === "number" &&
+        Number.isFinite(defaults.augmentation.stageEnteredAt)
+          ? Math.max(0, Math.floor(defaults.augmentation.stageEnteredAt))
+          : nowMs,
+      lastTransitionAt:
+        typeof defaults?.augmentation?.lastTransitionAt === "number" &&
+        Number.isFinite(defaults.augmentation.lastTransitionAt)
+          ? Math.max(0, Math.floor(defaults.augmentation.lastTransitionAt))
+          : nowMs,
+      lastTransitionReason:
+        typeof defaults?.augmentation?.lastTransitionReason === "string" &&
+        defaults.augmentation.lastTransitionReason.trim()
+          ? defaults.augmentation.lastTransitionReason.trim()
+          : undefined,
+      phaseRunCount:
+        typeof defaults?.augmentation?.phaseRunCount === "number" &&
+        Number.isFinite(defaults.augmentation.phaseRunCount)
+          ? Math.max(0, Math.floor(defaults.augmentation.phaseRunCount))
+          : 0,
+      policyVersion:
+        typeof defaults?.augmentation?.policyVersion === "string" &&
+        defaults.augmentation.policyVersion.trim()
+          ? defaults.augmentation.policyVersion.trim()
+          : DEFAULT_AUGMENTATION_POLICY_VERSION,
+      gaps: [],
+      candidates: [],
+      activeExperiments: [],
+      transitions: [],
     },
     taskSignals: defaults?.taskSignals ? { ...defaults.taskSignals } : {},
     dedupe: {},
@@ -388,6 +447,331 @@ export async function loadAutonomyState(params: {
         typeof lastWeeklyReviewKey === "string" && lastWeeklyReviewKey.trim()
           ? lastWeeklyReviewKey
           : undefined;
+    }
+    if (parsed.augmentation && typeof parsed.augmentation === "object") {
+      const stageRaw = (parsed.augmentation as { stage?: unknown }).stage;
+      const stageEnteredAtRaw = (parsed.augmentation as { stageEnteredAt?: unknown })
+        .stageEnteredAt;
+      const lastTransitionAtRaw = (parsed.augmentation as { lastTransitionAt?: unknown })
+        .lastTransitionAt;
+      const lastTransitionReasonRaw = (parsed.augmentation as { lastTransitionReason?: unknown })
+        .lastTransitionReason;
+      const phaseRunCountRaw = (parsed.augmentation as { phaseRunCount?: unknown }).phaseRunCount;
+      const policyVersionRaw = (parsed.augmentation as { policyVersion?: unknown }).policyVersion;
+      state.augmentation.stage = isAugmentationStage(stageRaw)
+        ? stageRaw
+        : state.augmentation.stage;
+      state.augmentation.stageEnteredAt =
+        typeof stageEnteredAtRaw === "number" && Number.isFinite(stageEnteredAtRaw)
+          ? Math.max(0, Math.floor(stageEnteredAtRaw))
+          : state.augmentation.stageEnteredAt;
+      state.augmentation.lastTransitionAt =
+        typeof lastTransitionAtRaw === "number" && Number.isFinite(lastTransitionAtRaw)
+          ? Math.max(0, Math.floor(lastTransitionAtRaw))
+          : state.augmentation.lastTransitionAt;
+      state.augmentation.lastTransitionReason =
+        typeof lastTransitionReasonRaw === "string" && lastTransitionReasonRaw.trim()
+          ? lastTransitionReasonRaw.trim()
+          : undefined;
+      state.augmentation.phaseRunCount =
+        typeof phaseRunCountRaw === "number" && Number.isFinite(phaseRunCountRaw)
+          ? Math.max(0, Math.floor(phaseRunCountRaw))
+          : state.augmentation.phaseRunCount;
+      state.augmentation.policyVersion =
+        typeof policyVersionRaw === "string" && policyVersionRaw.trim()
+          ? policyVersionRaw.trim()
+          : state.augmentation.policyVersion;
+
+      const gapsRaw = (parsed.augmentation as { gaps?: unknown }).gaps;
+      if (Array.isArray(gapsRaw)) {
+        state.augmentation.gaps = gapsRaw
+          .map((raw) => {
+            if (!raw || typeof raw !== "object") {
+              return null;
+            }
+            const id = normalizeOptionalString((raw as { id?: unknown }).id);
+            const key = normalizeOptionalString((raw as { key?: unknown }).key);
+            const title = normalizeOptionalString((raw as { title?: unknown }).title);
+            const category = normalizeOptionalString((raw as { category?: unknown }).category);
+            const status = normalizeOptionalString((raw as { status?: unknown }).status);
+            const lastSource = normalizeOptionalString(
+              (raw as { lastSource?: unknown }).lastSource,
+            );
+            if (!id || !key || !title || !category || !status || !lastSource) {
+              return null;
+            }
+            if (
+              category !== "capability" &&
+              category !== "quality" &&
+              category !== "reliability" &&
+              category !== "safety" &&
+              category !== "cost" &&
+              category !== "latency" &&
+              category !== "unknown"
+            ) {
+              return null;
+            }
+            if (
+              status !== "open" &&
+              status !== "planned" &&
+              status !== "addressed" &&
+              status !== "suppressed"
+            ) {
+              return null;
+            }
+            if (
+              lastSource !== "cron" &&
+              lastSource !== "webhook" &&
+              lastSource !== "email" &&
+              lastSource !== "subagent" &&
+              lastSource !== "manual"
+            ) {
+              return null;
+            }
+            const evidence = Array.isArray((raw as { evidence?: unknown }).evidence)
+              ? ((raw as { evidence?: unknown[] }).evidence ?? [])
+                  .filter(
+                    (value): value is string =>
+                      typeof value === "string" && value.trim().length > 0,
+                  )
+                  .slice(-10)
+              : [];
+            return {
+              id,
+              key,
+              title,
+              category,
+              status,
+              severity: clampInt(
+                typeof (raw as { severity?: unknown }).severity === "number"
+                  ? ((raw as { severity?: number }).severity ?? 0)
+                  : undefined,
+                0,
+                100,
+                0,
+              ),
+              confidence:
+                typeof (raw as { confidence?: unknown }).confidence === "number" &&
+                Number.isFinite((raw as { confidence?: number }).confidence)
+                  ? Math.max(0, Math.min(1, (raw as { confidence?: number }).confidence as number))
+                  : 0,
+              score: clampInt(
+                typeof (raw as { score?: unknown }).score === "number"
+                  ? ((raw as { score?: number }).score ?? 0)
+                  : undefined,
+                0,
+                10_000,
+                0,
+              ),
+              occurrences: clampInt(
+                typeof (raw as { occurrences?: unknown }).occurrences === "number"
+                  ? ((raw as { occurrences?: number }).occurrences ?? 0)
+                  : undefined,
+                1,
+                1_000_000,
+                1,
+              ),
+              firstSeenAt: clampInt(
+                typeof (raw as { firstSeenAt?: unknown }).firstSeenAt === "number"
+                  ? ((raw as { firstSeenAt?: number }).firstSeenAt ?? 0)
+                  : undefined,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                Date.now(),
+              ),
+              lastSeenAt: clampInt(
+                typeof (raw as { lastSeenAt?: unknown }).lastSeenAt === "number"
+                  ? ((raw as { lastSeenAt?: number }).lastSeenAt ?? 0)
+                  : undefined,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                Date.now(),
+              ),
+              lastSource,
+              evidence,
+            };
+          })
+          .filter((gap): gap is NonNullable<typeof gap> => gap !== null)
+          .toSorted((a, b) => b.score - a.score || b.lastSeenAt - a.lastSeenAt)
+          .slice(0, MAX_AUGMENTATION_GAPS);
+      }
+
+      const candidatesRaw = (parsed.augmentation as { candidates?: unknown }).candidates;
+      if (Array.isArray(candidatesRaw)) {
+        state.augmentation.candidates = candidatesRaw
+          .map((raw) => {
+            if (!raw || typeof raw !== "object") {
+              return null;
+            }
+            const id = normalizeOptionalString((raw as { id?: unknown }).id);
+            const sourceGapId = normalizeOptionalString(
+              (raw as { sourceGapId?: unknown }).sourceGapId,
+            );
+            const name = normalizeOptionalString((raw as { name?: unknown }).name);
+            const intent = normalizeOptionalString((raw as { intent?: unknown }).intent);
+            const status = normalizeOptionalString((raw as { status?: unknown }).status);
+            if (!id || !sourceGapId || !name || !intent || !status) {
+              return null;
+            }
+            if (
+              status !== "candidate" &&
+              status !== "planned" &&
+              status !== "verified" &&
+              status !== "rejected"
+            ) {
+              return null;
+            }
+            const executionClass = normalizeOptionalString(
+              (raw as { safety?: { executionClass?: unknown } }).safety?.executionClass,
+            );
+            if (
+              executionClass !== "read_only" &&
+              executionClass !== "reversible_write" &&
+              executionClass !== "destructive"
+            ) {
+              return null;
+            }
+            const constraintsRaw = (raw as { safety?: { constraints?: unknown } }).safety
+              ?.constraints;
+            const testsRaw = (raw as { tests?: unknown }).tests;
+            const constraints = Array.isArray(constraintsRaw)
+              ? constraintsRaw
+                  .filter(
+                    (value): value is string =>
+                      typeof value === "string" && value.trim().length > 0,
+                  )
+                  .slice(-20)
+              : [];
+            const tests = Array.isArray(testsRaw)
+              ? testsRaw
+                  .filter(
+                    (value): value is string =>
+                      typeof value === "string" && value.trim().length > 0,
+                  )
+                  .slice(-20)
+              : [];
+            return {
+              id,
+              sourceGapId,
+              name,
+              intent,
+              status,
+              priority: clampInt(
+                typeof (raw as { priority?: unknown }).priority === "number"
+                  ? ((raw as { priority?: number }).priority ?? 0)
+                  : undefined,
+                0,
+                10_000,
+                0,
+              ),
+              createdAt: clampInt(
+                typeof (raw as { createdAt?: unknown }).createdAt === "number"
+                  ? ((raw as { createdAt?: number }).createdAt ?? 0)
+                  : undefined,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                Date.now(),
+              ),
+              updatedAt: clampInt(
+                typeof (raw as { updatedAt?: unknown }).updatedAt === "number"
+                  ? ((raw as { updatedAt?: number }).updatedAt ?? 0)
+                  : undefined,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                Date.now(),
+              ),
+              safety: {
+                executionClass,
+                constraints,
+              },
+              tests,
+            };
+          })
+          .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
+          .toSorted((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          .slice(0, MAX_AUGMENTATION_CANDIDATES);
+      }
+
+      const experimentsRaw = (parsed.augmentation as { activeExperiments?: unknown })
+        .activeExperiments;
+      if (Array.isArray(experimentsRaw)) {
+        state.augmentation.activeExperiments = experimentsRaw
+          .map((raw) => {
+            if (!raw || typeof raw !== "object") {
+              return null;
+            }
+            const id = normalizeOptionalString((raw as { id?: unknown }).id);
+            const candidateId = normalizeOptionalString(
+              (raw as { candidateId?: unknown }).candidateId,
+            );
+            const status = normalizeOptionalString((raw as { status?: unknown }).status);
+            if (!id || !candidateId || !status) {
+              return null;
+            }
+            if (
+              status !== "active" &&
+              status !== "passed" &&
+              status !== "failed" &&
+              status !== "cancelled"
+            ) {
+              return null;
+            }
+            return {
+              id,
+              candidateId,
+              status,
+              startedAt: clampInt(
+                typeof (raw as { startedAt?: unknown }).startedAt === "number"
+                  ? ((raw as { startedAt?: number }).startedAt ?? 0)
+                  : undefined,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                Date.now(),
+              ),
+              updatedAt: clampInt(
+                typeof (raw as { updatedAt?: unknown }).updatedAt === "number"
+                  ? ((raw as { updatedAt?: number }).updatedAt ?? 0)
+                  : undefined,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                Date.now(),
+              ),
+              resultSummary: normalizeOptionalString(
+                (raw as { resultSummary?: unknown }).resultSummary,
+              ),
+            };
+          })
+          .filter((experiment): experiment is NonNullable<typeof experiment> => experiment !== null)
+          .slice(-MAX_AUGMENTATION_EXPERIMENTS);
+      }
+
+      const transitionsRaw = (parsed.augmentation as { transitions?: unknown }).transitions;
+      if (Array.isArray(transitionsRaw)) {
+        state.augmentation.transitions = transitionsRaw
+          .map((raw) => {
+            if (!raw || typeof raw !== "object") {
+              return null;
+            }
+            const from = normalizeOptionalString((raw as { from?: unknown }).from);
+            const to = normalizeOptionalString((raw as { to?: unknown }).to);
+            const reason = normalizeOptionalString((raw as { reason?: unknown }).reason);
+            if (!from || !to || !reason || !isAugmentationStage(from) || !isAugmentationStage(to)) {
+              return null;
+            }
+            const tsRaw = (raw as { ts?: unknown }).ts;
+            if (typeof tsRaw !== "number" || !Number.isFinite(tsRaw)) {
+              return null;
+            }
+            return {
+              from,
+              to,
+              reason,
+              ts: Math.max(0, Math.floor(tsRaw)),
+            };
+          })
+          .filter((transition): transition is NonNullable<typeof transition> => transition !== null)
+          .slice(-MAX_AUGMENTATION_TRANSITIONS);
+      }
     }
     state.taskSignals =
       parsed.taskSignals && typeof parsed.taskSignals === "object" ? { ...parsed.taskSignals } : {};

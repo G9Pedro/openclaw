@@ -39,6 +39,12 @@ describe("autonomy store", () => {
     expect(state.budget.cyclesUsed).toBe(0);
     expect(state.review.lastDailyReviewDayKey).toBeUndefined();
     expect(state.review.lastWeeklyReviewKey).toBeUndefined();
+    expect(state.augmentation.stage).toBe("discover");
+    expect(state.augmentation.policyVersion).toBe("2026-02-13");
+    expect(state.augmentation.phaseRunCount).toBe(0);
+    expect(state.augmentation.gaps).toEqual([]);
+    expect(state.augmentation.candidates).toEqual([]);
+    expect(state.augmentation.activeExperiments).toEqual([]);
     expect(state.taskSignals).toEqual({});
 
     const statePath = store.resolveAutonomyStatePath("ops");
@@ -158,6 +164,39 @@ describe("autonomy store", () => {
         createdAt: 1_000 + index,
         updatedAt: 2_000 + index,
       })),
+      augmentation: {
+        ...state.augmentation,
+        gaps: Array.from({ length: 260 }, (_, index) => ({
+          id: `gap-${index}`,
+          key: `gap:key:${index}`,
+          title: `gap ${index}`,
+          category: "quality",
+          status: "open",
+          severity: 50,
+          confidence: 0.6,
+          score: 50,
+          occurrences: 1,
+          firstSeenAt: 1000 + index,
+          lastSeenAt: 1100 + index,
+          lastSource: "manual",
+          evidence: [],
+        })),
+        candidates: Array.from({ length: 260 }, (_, index) => ({
+          id: `candidate-${index}`,
+          sourceGapId: `gap-${index}`,
+          name: `autonomy-candidate-${index}`,
+          intent: "close a gap",
+          status: "candidate",
+          priority: 10,
+          createdAt: 1000 + index,
+          updatedAt: 1100 + index,
+          safety: {
+            executionClass: "reversible_write",
+            constraints: ["must be reversible"],
+          },
+          tests: ["unit test"],
+        })),
+      },
     };
     await fs.writeFile(store.resolveAutonomyStatePath("ops"), JSON.stringify(oversized), "utf-8");
     await fs.writeFile(
@@ -170,6 +209,8 @@ describe("autonomy store", () => {
     expect(Object.keys(loaded.dedupe).length).toBeLessThanOrEqual(5000);
     expect(loaded.goals.length).toBeLessThanOrEqual(500);
     expect(loaded.tasks.length).toBeLessThanOrEqual(2000);
+    expect(loaded.augmentation.gaps.length).toBeLessThanOrEqual(200);
+    expect(loaded.augmentation.candidates.length).toBeLessThanOrEqual(250);
   });
 
   it("records cycles and writes markdown run log", async () => {

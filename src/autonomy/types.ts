@@ -1,5 +1,7 @@
 export type AutonomyEventSource = "cron" | "webhook" | "email" | "subagent" | "manual";
 
+export type AutonomyExecutionClass = "read_only" | "reversible_write" | "destructive";
+
 export type AutonomyEvent = {
   id: string;
   source: AutonomyEventSource;
@@ -88,6 +90,93 @@ export type AutonomyReviewState = {
   lastWeeklyReviewKey?: string;
 };
 
+export type AutonomyAugmentationStage =
+  | "discover"
+  | "design"
+  | "synthesize"
+  | "verify"
+  | "canary"
+  | "promote"
+  | "observe"
+  | "learn"
+  | "retire";
+
+export type AutonomyAugmentationGapCategory =
+  | "capability"
+  | "quality"
+  | "reliability"
+  | "safety"
+  | "cost"
+  | "latency"
+  | "unknown";
+
+export type AutonomyAugmentationGapStatus = "open" | "planned" | "addressed" | "suppressed";
+
+export type AutonomyAugmentationGap = {
+  id: string;
+  key: string;
+  title: string;
+  category: AutonomyAugmentationGapCategory;
+  status: AutonomyAugmentationGapStatus;
+  severity: number;
+  confidence: number;
+  score: number;
+  occurrences: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  lastSource: AutonomyEventSource;
+  evidence: string[];
+};
+
+export type AutonomySkillCandidateStatus = "candidate" | "planned" | "verified" | "rejected";
+
+export type AutonomySkillCandidate = {
+  id: string;
+  sourceGapId: string;
+  name: string;
+  intent: string;
+  status: AutonomySkillCandidateStatus;
+  priority: number;
+  createdAt: number;
+  updatedAt: number;
+  safety: {
+    executionClass: AutonomyExecutionClass;
+    constraints: string[];
+  };
+  tests: string[];
+};
+
+export type AutonomyExperimentStatus = "active" | "passed" | "failed" | "cancelled";
+
+export type AutonomyAugmentationExperiment = {
+  id: string;
+  candidateId: string;
+  status: AutonomyExperimentStatus;
+  startedAt: number;
+  updatedAt: number;
+  resultSummary?: string;
+};
+
+export type AutonomyAugmentationTransition = {
+  from: AutonomyAugmentationStage;
+  to: AutonomyAugmentationStage;
+  ts: number;
+  reason: string;
+};
+
+export type AutonomyAugmentationState = {
+  stage: AutonomyAugmentationStage;
+  stageEnteredAt: number;
+  lastTransitionAt: number;
+  lastTransitionReason?: string;
+  phaseRunCount: number;
+  policyVersion: string;
+  gaps: AutonomyAugmentationGap[];
+  candidates: AutonomySkillCandidate[];
+  activeExperiments: AutonomyAugmentationExperiment[];
+  transitions: AutonomyAugmentationTransition[];
+};
+
 export type AutonomyState = {
   version: 1;
   agentId: string;
@@ -104,6 +193,7 @@ export type AutonomyState = {
   safety: AutonomySafetyPolicy;
   budget: AutonomyBudgetUsage;
   review: AutonomyReviewState;
+  augmentation: AutonomyAugmentationState;
   taskSignals: Record<string, string>;
   dedupe: Record<string, number>;
   goals: AutonomyGoal[];

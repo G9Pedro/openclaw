@@ -7,6 +7,7 @@ import {
   DEFAULT_AUTONOMY_MISSION,
   DEFAULT_AUTONOMY_TASKS_FILE,
 } from "../../agents/autonomy-primitives.js";
+import { readAutonomyLedgerEntries } from "../../autonomy/ledger/store.js";
 import {
   enqueueAutonomyEvent,
   loadAutonomyState,
@@ -318,6 +319,15 @@ export function registerCronAutonomousCommand(cron: Command) {
               `safety.emitWeeklyReviewEvents=${state.safety.emitWeeklyReviewEvents}`,
               `review.lastDailyReviewDayKey=${state.review.lastDailyReviewDayKey ?? "-"}`,
               `review.lastWeeklyReviewKey=${state.review.lastWeeklyReviewKey ?? "-"}`,
+              `augmentation.stage=${state.augmentation.stage}`,
+              `augmentation.stageEnteredAt=${state.augmentation.stageEnteredAt}`,
+              `augmentation.lastTransitionAt=${state.augmentation.lastTransitionAt}`,
+              `augmentation.lastTransitionReason=${state.augmentation.lastTransitionReason ?? "-"}`,
+              `augmentation.policyVersion=${state.augmentation.policyVersion}`,
+              `augmentation.phaseRunCount=${state.augmentation.phaseRunCount}`,
+              `augmentation.gaps=${state.augmentation.gaps.length}`,
+              `augmentation.candidates=${state.augmentation.candidates.length}`,
+              `augmentation.activeExperiments=${state.augmentation.activeExperiments.length}`,
               `metrics.cycles=${state.metrics.cycles}`,
               `metrics.ok=${state.metrics.ok}`,
               `metrics.error=${state.metrics.error}`,
@@ -356,6 +366,14 @@ export function registerCronAutonomousCommand(cron: Command) {
           if (state.metrics.consecutiveErrors > 0) {
             warnings.push(`consecutive errors: ${state.metrics.consecutiveErrors}`);
           }
+          const stageAgeHours = Math.floor(
+            Math.max(0, Date.now() - state.augmentation.stageEnteredAt) / 3_600_000,
+          );
+          if (stageAgeHours >= 24) {
+            warnings.push(
+              `augmentation stage '${state.augmentation.stage}' has been active for ${stageAgeHours}h`,
+            );
+          }
           if (typeof cycleUsageRatio === "number" && cycleUsageRatio >= 0.9) {
             warnings.push(
               `daily cycle budget near limit (${state.budget.cyclesUsed}/${cycleBudget})`,
@@ -373,6 +391,13 @@ export function registerCronAutonomousCommand(cron: Command) {
             pauseReason: state.pauseReason,
             warnings,
             metrics: state.metrics,
+            augmentation: {
+              stage: state.augmentation.stage,
+              stageEnteredAt: state.augmentation.stageEnteredAt,
+              gaps: state.augmentation.gaps.length,
+              candidates: state.augmentation.candidates.length,
+              activeExperiments: state.augmentation.activeExperiments.length,
+            },
             budget: {
               dayKey: state.budget.dayKey,
               cyclesUsed: state.budget.cyclesUsed,
@@ -392,6 +417,10 @@ export function registerCronAutonomousCommand(cron: Command) {
               `pauseReason=${health.pauseReason ?? "none"}`,
               `cycles=${health.metrics.cycles} (ok=${health.metrics.ok} error=${health.metrics.error} skipped=${health.metrics.skipped})`,
               `consecutiveErrors=${health.metrics.consecutiveErrors}`,
+              `augmentation.stage=${health.augmentation.stage}`,
+              `augmentation.gaps=${health.augmentation.gaps}`,
+              `augmentation.candidates=${health.augmentation.candidates}`,
+              `augmentation.activeExperiments=${health.augmentation.activeExperiments}`,
               `budget.day=${health.budget.dayKey}`,
               `budget.cycles=${health.budget.cyclesUsed}/${health.budget.cycleBudget ?? "unbounded"}`,
               `budget.tokens=${health.budget.tokensUsed}/${health.budget.tokenBudget ?? "unbounded"}`,
@@ -400,6 +429,48 @@ export function registerCronAutonomousCommand(cron: Command) {
                 : []),
             ].join("\n"),
           );
+        } catch (err) {
+          defaultRuntime.error(danger(String(err)));
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("autonomous-ledger")
+      .description("Inspect augmentation ledger entries for an agent")
+      .requiredOption("--agent <id>", "Target agent id")
+      .option("--limit <n>", "Max entries to return", "50")
+      .option("--offset <n>", "Skip first N entries", "0")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const agentId = sanitizeAgentId(String(opts.agent));
+          const limit = parsePositiveIntOrUndefined(opts.limit) ?? 50;
+          const offset = parsePositiveIntOrUndefined(opts.offset) ?? 0;
+          const entries = await readAutonomyLedgerEntries({
+            agentId,
+            limit,
+            offset,
+          });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify({ agentId, entries }, null, 2));
+            return;
+          }
+          if (entries.length === 0) {
+            defaultRuntime.log(`No augmentation ledger entries for agent=${agentId}`);
+            return;
+          }
+          const lines = [
+            `agent=${agentId}`,
+            `entries=${entries.length}`,
+            ...entries.map(
+              (entry) =>
+                `- ${new Date(entry.ts).toISOString()} [${entry.stage}] ${entry.eventType}: ${entry.summary}`,
+            ),
+          ];
+          defaultRuntime.log(lines.join("\n"));
         } catch (err) {
           defaultRuntime.error(danger(String(err)));
           defaultRuntime.exit(1);

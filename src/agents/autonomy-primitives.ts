@@ -109,6 +109,11 @@ export type AutonomousCycleContext = {
     dailyCycleBudget?: number;
     dailyTokenBudget?: number;
   };
+  augmentation?: {
+    stage: string;
+    gaps: number;
+    candidates: number;
+  };
 };
 
 export function buildAutonomousCyclePreamble(context: AutonomousCycleContext) {
@@ -127,6 +132,12 @@ export function buildAutonomousCyclePreamble(context: AutonomousCycleContext) {
     const tokenBudget = context.budget.dailyTokenBudget ?? "unbounded";
     lines.push(
       `Budget (${context.budget.dayKey}): cycles ${context.budget.cyclesUsed}/${cycleBudget}, tokens ${context.budget.tokensUsed}/${tokenBudget}`,
+    );
+    lines.push("");
+  }
+  if (context.augmentation) {
+    lines.push(
+      `Augmentation: stage=${context.augmentation.stage}, gaps=${context.augmentation.gaps}, candidates=${context.augmentation.candidates}`,
     );
     lines.push("");
   }

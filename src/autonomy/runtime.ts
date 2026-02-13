@@ -15,6 +15,28 @@ import {
   normalizeAutonomyMaxActions,
   normalizeAutonomyText,
 } from "../agents/autonomy-primitives.js";
+import { emitDiagnosticEvent } from "../infra/diagnostic-events.js";
+import { upsertGapRegistry } from "./discovery/gap-registry.js";
+import { normalizeAutonomySignals } from "./discovery/signal-normalizer.js";
+import {
+  createAugmentationPhaseEnterEvent,
+  createAugmentationPhaseExitEvent,
+  createAugmentationPolicyDeniedEvent,
+  createCandidatesUpdatedEvent,
+  createDiscoveryUpdatedEvent,
+} from "./events.js";
+import { appendAutonomyLedgerEntry } from "./ledger/store.js";
+import {
+  createDefaultAutonomyPolicyConfig,
+  evaluateAutonomyPolicy,
+  resolveAutonomyActionClass,
+} from "./policy/runtime.js";
+import {
+  resolveExecutionClassForStage,
+  resolveNextAugmentationStage,
+  transitionAugmentationStage,
+} from "./runtime.phase-machine.js";
+import { planSkillCandidates } from "./skill-forge/planner.js";
 import {
   applyAutonomyPause,
   appendAutonomyWorkspaceLog,
@@ -244,6 +266,189 @@ function buildSyntheticAutonomyEvents(params: {
   return events;
 }
 
+async function processAugmentationCycle(params: {
+  state: AutonomyState;
+  nowMs: number;
+  events: AutonomyEvent[];
+}) {
+  const correlationId = `cycle-${params.nowMs}`;
+  const augmentationEvents: AutonomyEvent[] = [];
+  params.state.augmentation.phaseRunCount += 1;
+
+  const signals = normalizeAutonomySignals(params.events);
+  if (signals.length > 0) {
+    params.state.augmentation.gaps = upsertGapRegistry({
+      gaps: params.state.augmentation.gaps,
+      signals,
+      nowMs: params.nowMs,
+    });
+    const discoveryEvent = createDiscoveryUpdatedEvent({
+      nowMs: params.nowMs,
+      signals: signals.length,
+      openGaps: params.state.augmentation.gaps.filter((gap) => gap.status === "open").length,
+    });
+    augmentationEvents.push(discoveryEvent);
+    await appendAutonomyLedgerEntry({
+      agentId: params.state.agentId,
+      correlationId,
+      eventType: "discovery_update",
+      stage: params.state.augmentation.stage,
+      actor: "autonomy-runtime",
+      summary: `processed ${signals.length} discovery signals`,
+      evidence: {
+        signalCount: signals.length,
+        openGapCount: params.state.augmentation.gaps.filter((gap) => gap.status === "open").length,
+      },
+      ts: params.nowMs,
+    });
+  }
+
+  const planned = planSkillCandidates({
+    nowMs: params.nowMs,
+    gaps: params.state.augmentation.gaps,
+    existingCandidates: params.state.augmentation.candidates,
+  });
+  if (planned.generatedCount > 0) {
+    params.state.augmentation.candidates = planned.candidates;
+    const candidatesEvent = createCandidatesUpdatedEvent({
+      nowMs: params.nowMs,
+      generated: planned.generatedCount,
+      totalCandidates: params.state.augmentation.candidates.length,
+    });
+    augmentationEvents.push(candidatesEvent);
+    await appendAutonomyLedgerEntry({
+      agentId: params.state.agentId,
+      correlationId,
+      eventType: "candidate_update",
+      stage: params.state.augmentation.stage,
+      actor: "skill-planner",
+      summary: `generated ${planned.generatedCount} skill candidate(s)`,
+      evidence: {
+        generatedCount: planned.generatedCount,
+        totalCandidates: params.state.augmentation.candidates.length,
+      },
+      ts: params.nowMs,
+    });
+  }
+
+  const nextStage = resolveNextAugmentationStage(params.state);
+  const action = `autonomy.stage.${nextStage}`;
+  const policyConfig = createDefaultAutonomyPolicyConfig({
+    version: params.state.augmentation.policyVersion,
+  });
+  const executionClass = resolveAutonomyActionClass({
+    action,
+    fallbackClass: resolveExecutionClassForStage(nextStage),
+    config: policyConfig,
+  });
+  const policyDecision = evaluateAutonomyPolicy({
+    action,
+    executionClass,
+    config: policyConfig,
+    approvedByOperator: false,
+  });
+
+  if (!policyDecision.allowed) {
+    const deniedEvent = createAugmentationPolicyDeniedEvent({
+      stage: nextStage,
+      executionClass,
+      nowMs: params.nowMs,
+      reason: policyDecision.reason,
+    });
+    augmentationEvents.push(deniedEvent);
+    emitDiagnosticEvent({
+      type: "autonomy.phase",
+      agentId: params.state.agentId,
+      stage: nextStage,
+      action: "blocked",
+      reason: policyDecision.reason,
+      lane: "autonomy",
+      gapCount: params.state.augmentation.gaps.length,
+      candidateCount: params.state.augmentation.candidates.length,
+      durationMs: 0,
+    });
+    await appendAutonomyLedgerEntry({
+      agentId: params.state.agentId,
+      correlationId,
+      eventType: "policy_denied",
+      stage: nextStage,
+      actor: "policy-runtime",
+      summary: policyDecision.reason,
+      evidence: {
+        action,
+        executionClass,
+        policyVersion: policyDecision.policyVersion,
+      },
+      ts: params.nowMs,
+    });
+    return augmentationEvents;
+  }
+
+  const currentStage = params.state.augmentation.stage;
+  if (currentStage !== nextStage) {
+    transitionAugmentationStage(params.state, nextStage, "phase progression", params.nowMs);
+    const exitEvent = createAugmentationPhaseExitEvent({
+      stage: currentStage,
+      nowMs: params.nowMs,
+      reason: "phase progression",
+    });
+    const enterEvent = createAugmentationPhaseEnterEvent({
+      stage: nextStage,
+      nowMs: params.nowMs,
+      reason: "phase progression",
+    });
+    augmentationEvents.push(exitEvent, enterEvent);
+    emitDiagnosticEvent({
+      type: "autonomy.phase",
+      agentId: params.state.agentId,
+      stage: currentStage,
+      action: "exit",
+      reason: "phase progression",
+      lane: "autonomy",
+      gapCount: params.state.augmentation.gaps.length,
+      candidateCount: params.state.augmentation.candidates.length,
+      durationMs: Math.max(0, params.nowMs - params.state.augmentation.stageEnteredAt),
+    });
+    emitDiagnosticEvent({
+      type: "autonomy.phase",
+      agentId: params.state.agentId,
+      stage: nextStage,
+      action: "enter",
+      reason: "phase progression",
+      lane: "autonomy",
+      gapCount: params.state.augmentation.gaps.length,
+      candidateCount: params.state.augmentation.candidates.length,
+      durationMs: 0,
+    });
+    await appendAutonomyLedgerEntry({
+      agentId: params.state.agentId,
+      correlationId,
+      eventType: "phase_exit",
+      stage: currentStage,
+      actor: "phase-machine",
+      summary: `exited ${currentStage}`,
+      evidence: {
+        to: nextStage,
+      },
+      ts: params.nowMs,
+    });
+    await appendAutonomyLedgerEntry({
+      agentId: params.state.agentId,
+      correlationId,
+      eventType: "phase_enter",
+      stage: nextStage,
+      actor: "phase-machine",
+      summary: `entered ${nextStage}`,
+      evidence: {
+        from: currentStage,
+      },
+      ts: params.nowMs,
+    });
+  }
+
+  return augmentationEvents;
+}
+
 export async function prepareAutonomyRuntime(params: {
   agentId: string;
   workspaceDir: string;
@@ -467,13 +672,19 @@ export async function prepareAutonomyRuntime(params: {
         },
       });
     }
-    const events = [
+    const runtimeEvents = [
       cycleEvent,
       ...resumeEvent,
       ...queueHealthEvents,
       ...syntheticEvents,
       ...drained.events,
     ];
+    const augmentationEvents = await processAugmentationCycle({
+      state,
+      nowMs,
+      events: runtimeEvents,
+    });
+    const events = [...runtimeEvents, ...augmentationEvents];
     recordAutonomyEvents(state, events);
 
     const basePrompt = buildAutonomousCoordinationPrompt({
@@ -505,6 +716,11 @@ export async function prepareAutonomyRuntime(params: {
         tokensUsed: state.budget.tokensUsed,
         dailyCycleBudget: state.safety.dailyCycleBudget,
         dailyTokenBudget: state.safety.dailyTokenBudget,
+      },
+      augmentation: {
+        stage: state.augmentation.stage,
+        gaps: state.augmentation.gaps.length,
+        candidates: state.augmentation.candidates.length,
       },
     });
     await saveAutonomyState(state);

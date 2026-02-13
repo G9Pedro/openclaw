@@ -463,4 +463,84 @@ describe("autonomy runtime", () => {
       lockToken: prepared.lockToken,
     });
   });
+
+  it("updates augmentation discovery/candidate state from runtime events", async () => {
+    const runtime = await import("./runtime.js");
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(
+      prepared.events.some((event) => event.type === "autonomy.augmentation.discovery.updated"),
+    ).toBe(true);
+    expect(prepared.state.augmentation.phaseRunCount).toBeGreaterThan(0);
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
+
+  it("denies destructive augmentation phase transition without approval", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.augmentation.stage = "canary";
+    state.augmentation.candidates = [
+      {
+        id: "candidate-1",
+        sourceGapId: "gap-1",
+        name: "autonomy-candidate-1",
+        intent: "test promote phase",
+        status: "verified",
+        priority: 100,
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+        safety: {
+          executionClass: "reversible_write",
+          constraints: ["must be reversible"],
+        },
+        tests: ["unit"],
+      },
+    ];
+    await store.saveAutonomyState(state);
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(prepared.state.augmentation.stage).toBe("canary");
+    expect(
+      prepared.events.some((event) => event.type === "autonomy.augmentation.policy.denied"),
+    ).toBe(true);
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
 });
