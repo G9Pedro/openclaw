@@ -18,6 +18,8 @@ describe("autonomy runtime", () => {
   });
 
   afterEach(async () => {
+    const hooksGlobal = await import("../plugins/hook-runner-global.js");
+    hooksGlobal.resetGlobalHookRunner();
     if (priorStateDir === undefined) {
       delete process.env.OPENCLAW_STATE_DIR;
     } else {
@@ -623,6 +625,122 @@ describe("autonomy runtime", () => {
       droppedOverflow: verified.droppedOverflow,
       remainingEvents: verified.remainingEvents,
       lockToken: verified.lockToken,
+    });
+  });
+
+  it("ingests plugin-provided autonomy signals", async () => {
+    const hooksGlobal = await import("../plugins/hook-runner-global.js");
+    hooksGlobal.initializeGlobalHookRunner({
+      plugins: [],
+      tools: [],
+      hooks: [],
+      typedHooks: [
+        {
+          pluginId: "autonomy-test-plugin",
+          hookName: "autonomy_signal",
+          priority: 10,
+          source: "test",
+          handler: () => ({
+            events: [
+              {
+                source: "manual",
+                type: "plugin.autonomy.signal",
+                dedupeKey: "plugin:autonomy:signal",
+              },
+            ],
+          }),
+        },
+      ],
+      channels: [],
+      providers: [],
+      gatewayHandlers: {},
+      httpHandlers: [],
+      httpRoutes: [],
+      cliRegistrars: [],
+      services: [],
+      commands: [],
+      diagnostics: [],
+    });
+
+    const runtime = await import("./runtime.js");
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(prepared.events.some((event) => event.type === "plugin.autonomy.signal")).toBe(true);
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
+    });
+  });
+
+  it("blocks promote stage when promotion gates fail", async () => {
+    const store = await import("./store.js");
+    const runtime = await import("./runtime.js");
+    const state = await store.loadAutonomyState({ agentId: "ops" });
+    state.augmentation.stage = "promote";
+    state.augmentation.candidates = [];
+    state.recentCycles = [
+      {
+        ts: Date.now() - 10_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 100,
+      },
+      {
+        ts: Date.now() - 9_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 100,
+      },
+      {
+        ts: Date.now() - 8_000,
+        status: "ok",
+        processedEvents: 1,
+        durationMs: 100,
+      },
+    ];
+    await store.saveAutonomyState(state);
+
+    const prepared = await runtime.prepareAutonomyRuntime({
+      agentId: "ops",
+      workspaceDir,
+      autonomy: { enabled: true },
+    });
+    if ("skipped" in prepared) {
+      throw new Error("expected run to execute");
+    }
+    expect(prepared.state.augmentation.stage).toBe("promote");
+    const deniedEvent = prepared.events.find(
+      (event) => event.type === "autonomy.augmentation.policy.denied",
+    );
+    expect(deniedEvent).toBeDefined();
+    expect(String(deniedEvent?.payload?.reason ?? "")).toContain("no verified candidates");
+
+    await runtime.finalizeAutonomyRuntime({
+      workspaceDir,
+      state: prepared.state,
+      cycleStartedAt: prepared.cycleStartedAt,
+      status: "ok",
+      events: prepared.events,
+      droppedDuplicates: prepared.droppedDuplicates,
+      droppedInvalid: prepared.droppedInvalid,
+      droppedOverflow: prepared.droppedOverflow,
+      remainingEvents: prepared.remainingEvents,
+      lockToken: prepared.lockToken,
     });
   });
 });

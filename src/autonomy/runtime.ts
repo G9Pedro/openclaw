@@ -16,9 +16,11 @@ import {
   normalizeAutonomyText,
 } from "../agents/autonomy-primitives.js";
 import { emitDiagnosticEvent } from "../infra/diagnostic-events.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { evaluateCanaryHealth } from "./canary/manager.js";
 import { upsertGapRegistry } from "./discovery/gap-registry.js";
 import { normalizeAutonomySignals } from "./discovery/signal-normalizer.js";
+import { evaluatePromotionGates } from "./eval/gates.js";
 import {
   createAugmentationPhaseEnterEvent,
   createAugmentationPhaseExitEvent,
@@ -270,6 +272,52 @@ function buildSyntheticAutonomyEvents(params: {
   return events;
 }
 
+function normalizePluginSignalEvents(params: {
+  nowMs: number;
+  events: Array<{
+    source?: "cron" | "webhook" | "email" | "subagent" | "manual";
+    type: string;
+    dedupeKey?: string;
+    payload?: Record<string, unknown>;
+  }>;
+}) {
+  return params.events
+    .map((event, index): AutonomyEvent | null => {
+      if (typeof event.type !== "string" || !event.type.trim()) {
+        return null;
+      }
+      return {
+        id: `plugin-signal-${params.nowMs}-${index}`,
+        source: event.source ?? "manual",
+        type: event.type.trim(),
+        ts: params.nowMs,
+        dedupeKey:
+          typeof event.dedupeKey === "string" && event.dedupeKey.trim()
+            ? event.dedupeKey
+            : undefined,
+        payload:
+          event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+            ? event.payload
+            : undefined,
+      };
+    })
+    .filter((event): event is AutonomyEvent => event !== null);
+}
+
+function resolveRecentCanaryStatus(state: AutonomyState): "healthy" | "regressed" | undefined {
+  for (let index = state.recentEvents.length - 1; index >= 0; index -= 1) {
+    const event = state.recentEvents[index];
+    if (!event || event.type !== "autonomy.augmentation.canary.evaluated") {
+      continue;
+    }
+    const status = event.payload?.status;
+    if (status === "healthy" || status === "regressed") {
+      return status;
+    }
+  }
+  return undefined;
+}
+
 async function processAugmentationCycle(params: {
   state: AutonomyState;
   nowMs: number;
@@ -280,7 +328,34 @@ async function processAugmentationCycle(params: {
   const augmentationEvents: AutonomyEvent[] = [];
   params.state.augmentation.phaseRunCount += 1;
 
-  const signals = normalizeAutonomySignals(params.events);
+  const hookRunner = getGlobalHookRunner();
+  let pluginSignalEvents: AutonomyEvent[] = [];
+  if (hookRunner?.hasHooks("autonomy_signal")) {
+    const hookResult = await hookRunner.runAutonomySignal(
+      {
+        events: params.events.map((event) => ({
+          source: event.source,
+          type: event.type,
+          ts: event.ts,
+          dedupeKey: event.dedupeKey,
+          payload: event.payload,
+        })),
+      },
+      {
+        agentId: params.state.agentId,
+        workspaceDir: params.workspaceDir,
+        stage: params.state.augmentation.stage,
+        nowMs: params.nowMs,
+      },
+    );
+    pluginSignalEvents = normalizePluginSignalEvents({
+      nowMs: params.nowMs,
+      events: hookResult?.events ?? [],
+    });
+  }
+  augmentationEvents.push(...pluginSignalEvents);
+
+  const signals = normalizeAutonomySignals([...params.events, ...pluginSignalEvents]);
   if (signals.length > 0) {
     params.state.augmentation.gaps = upsertGapRegistry({
       gaps: params.state.augmentation.gaps,
@@ -302,6 +377,7 @@ async function processAugmentationCycle(params: {
       summary: `processed ${signals.length} discovery signals`,
       evidence: {
         signalCount: signals.length,
+        pluginSignalCount: pluginSignalEvents.length,
         openGapCount: params.state.augmentation.gaps.filter((gap) => gap.status === "open").length,
       },
       ts: params.nowMs,
@@ -462,57 +538,112 @@ async function processAugmentationCycle(params: {
     }
   }
 
-  const nextStage = resolveNextAugmentationStage(params.state);
-  const action = `autonomy.stage.${nextStage}`;
-  const policyConfig = createDefaultAutonomyPolicyConfig({
-    version: params.state.augmentation.policyVersion,
-  });
-  const executionClass = resolveAutonomyActionClass({
-    action,
-    fallbackClass: resolveExecutionClassForStage(nextStage),
-    config: policyConfig,
-  });
-  const policyDecision = evaluateAutonomyPolicy({
-    action,
-    executionClass,
-    config: policyConfig,
-    approvedByOperator: false,
-  });
+  let nextStage = resolveNextAugmentationStage(params.state);
+  let skipPolicyCheck = false;
+  if (stageBeforeActions === "promote") {
+    const recentCycles = params.state.recentCycles.slice(-5);
+    const actionable = recentCycles.filter((cycle) => cycle.status !== "skipped");
+    const recentErrorCount = actionable.filter((cycle) => cycle.status === "error").length;
+    const verifiedCandidateCount = params.state.augmentation.candidates.filter(
+      (candidate) => candidate.status === "verified",
+    ).length;
+    const gate = evaluatePromotionGates({
+      verifiedCandidateCount,
+      recentCycleCount: actionable.length,
+      recentErrorCount,
+      canaryStatus: resolveRecentCanaryStatus(params.state),
+    });
+    if (!gate.passed) {
+      nextStage = stageBeforeActions;
+      skipPolicyCheck = true;
+      const deniedEvent = createAugmentationPolicyDeniedEvent({
+        stage: stageBeforeActions,
+        executionClass: "destructive",
+        nowMs: params.nowMs,
+        reason: gate.reason,
+      });
+      augmentationEvents.push(deniedEvent);
+      emitDiagnosticEvent({
+        type: "autonomy.phase",
+        agentId: params.state.agentId,
+        stage: stageBeforeActions,
+        action: "blocked",
+        reason: gate.reason,
+        lane: "autonomy",
+        gapCount: params.state.augmentation.gaps.length,
+        candidateCount: params.state.augmentation.candidates.length,
+        durationMs: 0,
+      });
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId,
+        eventType: "policy_denied",
+        stage: stageBeforeActions,
+        actor: "promotion-gates",
+        summary: gate.reason,
+        evidence: {
+          verifiedCandidateCount,
+          recentCycleCount: actionable.length,
+          recentErrorCount,
+          errorRate: gate.errorRate,
+        },
+        ts: params.nowMs,
+      });
+    }
+  }
 
-  if (!policyDecision.allowed) {
-    const deniedEvent = createAugmentationPolicyDeniedEvent({
-      stage: nextStage,
+  if (!skipPolicyCheck) {
+    const action = `autonomy.stage.${nextStage}`;
+    const policyConfig = createDefaultAutonomyPolicyConfig({
+      version: params.state.augmentation.policyVersion,
+    });
+    const executionClass = resolveAutonomyActionClass({
+      action,
+      fallbackClass: resolveExecutionClassForStage(nextStage),
+      config: policyConfig,
+    });
+    const policyDecision = evaluateAutonomyPolicy({
+      action,
       executionClass,
-      nowMs: params.nowMs,
-      reason: policyDecision.reason,
+      config: policyConfig,
+      approvedByOperator: false,
     });
-    augmentationEvents.push(deniedEvent);
-    emitDiagnosticEvent({
-      type: "autonomy.phase",
-      agentId: params.state.agentId,
-      stage: nextStage,
-      action: "blocked",
-      reason: policyDecision.reason,
-      lane: "autonomy",
-      gapCount: params.state.augmentation.gaps.length,
-      candidateCount: params.state.augmentation.candidates.length,
-      durationMs: 0,
-    });
-    await appendAutonomyLedgerEntry({
-      agentId: params.state.agentId,
-      correlationId,
-      eventType: "policy_denied",
-      stage: nextStage,
-      actor: "policy-runtime",
-      summary: policyDecision.reason,
-      evidence: {
-        action,
+
+    if (!policyDecision.allowed) {
+      const deniedEvent = createAugmentationPolicyDeniedEvent({
+        stage: nextStage,
         executionClass,
-        policyVersion: policyDecision.policyVersion,
-      },
-      ts: params.nowMs,
-    });
-    return augmentationEvents;
+        nowMs: params.nowMs,
+        reason: policyDecision.reason,
+      });
+      augmentationEvents.push(deniedEvent);
+      emitDiagnosticEvent({
+        type: "autonomy.phase",
+        agentId: params.state.agentId,
+        stage: nextStage,
+        action: "blocked",
+        reason: policyDecision.reason,
+        lane: "autonomy",
+        gapCount: params.state.augmentation.gaps.length,
+        candidateCount: params.state.augmentation.candidates.length,
+        durationMs: 0,
+      });
+      await appendAutonomyLedgerEntry({
+        agentId: params.state.agentId,
+        correlationId,
+        eventType: "policy_denied",
+        stage: nextStage,
+        actor: "policy-runtime",
+        summary: policyDecision.reason,
+        evidence: {
+          action,
+          executionClass,
+          policyVersion: policyDecision.policyVersion,
+        },
+        ts: params.nowMs,
+      });
+      return augmentationEvents;
+    }
   }
 
   const currentStage = params.state.augmentation.stage;

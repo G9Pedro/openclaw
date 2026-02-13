@@ -19,6 +19,9 @@ import type {
   PluginHookGatewayContext,
   PluginHookGatewayStartEvent,
   PluginHookGatewayStopEvent,
+  PluginHookAutonomySignalContext,
+  PluginHookAutonomySignalEvent,
+  PluginHookAutonomySignalResult,
   PluginHookMessageContext,
   PluginHookMessageReceivedEvent,
   PluginHookMessageSendingEvent,
@@ -61,6 +64,9 @@ export type {
   PluginHookGatewayContext,
   PluginHookGatewayStartEvent,
   PluginHookGatewayStopEvent,
+  PluginHookAutonomySignalContext,
+  PluginHookAutonomySignalEvent,
+  PluginHookAutonomySignalResult,
 };
 
 export type HookRunnerLogger = {
@@ -421,6 +427,25 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     return runVoidHook("gateway_stop", event, ctx);
   }
 
+  /**
+   * Run autonomy_signal hook.
+   * Allows plugins to emit additional autonomy discovery signals.
+   * Runs sequentially and merges emitted events.
+   */
+  async function runAutonomySignal(
+    event: PluginHookAutonomySignalEvent,
+    ctx: PluginHookAutonomySignalContext,
+  ): Promise<PluginHookAutonomySignalResult | undefined> {
+    return runModifyingHook<"autonomy_signal", PluginHookAutonomySignalResult>(
+      "autonomy_signal",
+      event,
+      ctx,
+      (acc, next) => ({
+        events: [...(acc?.events ?? []), ...(next.events ?? [])],
+      }),
+    );
+  }
+
   // =========================================================================
   // Utility
   // =========================================================================
@@ -459,6 +484,7 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     // Gateway hooks
     runGatewayStart,
     runGatewayStop,
+    runAutonomySignal,
     // Utility
     hasHooks,
     getHookCount,

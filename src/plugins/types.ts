@@ -298,7 +298,8 @@ export type PluginHookName =
   | "session_start"
   | "session_end"
   | "gateway_start"
-  | "gateway_stop";
+  | "gateway_stop"
+  | "autonomy_signal";
 
 // Agent context shared across agent hooks
 export type PluginHookAgentContext = {
@@ -460,6 +461,34 @@ export type PluginHookGatewayStopEvent = {
   reason?: string;
 };
 
+// Autonomy signal context
+export type PluginHookAutonomySignalContext = {
+  agentId: string;
+  workspaceDir: string;
+  stage: string;
+  nowMs: number;
+};
+
+// autonomy_signal hook
+export type PluginHookAutonomySignalEvent = {
+  events: Array<{
+    source: "cron" | "webhook" | "email" | "subagent" | "manual";
+    type: string;
+    ts: number;
+    dedupeKey?: string;
+    payload?: Record<string, unknown>;
+  }>;
+};
+
+export type PluginHookAutonomySignalResult = {
+  events?: Array<{
+    source?: "cron" | "webhook" | "email" | "subagent" | "manual";
+    type: string;
+    dedupeKey?: string;
+    payload?: Record<string, unknown>;
+  }>;
+};
+
 // Hook handler types mapped by hook name
 export type PluginHookHandlerMap = {
   before_agent_start: (
@@ -515,6 +544,10 @@ export type PluginHookHandlerMap = {
     event: PluginHookGatewayStopEvent,
     ctx: PluginHookGatewayContext,
   ) => Promise<void> | void;
+  autonomy_signal: (
+    event: PluginHookAutonomySignalEvent,
+    ctx: PluginHookAutonomySignalContext,
+  ) => Promise<PluginHookAutonomySignalResult | void> | PluginHookAutonomySignalResult | void;
 };
 
 export type PluginHookRegistration<K extends PluginHookName = PluginHookName> = {
