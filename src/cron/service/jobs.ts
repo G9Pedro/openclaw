@@ -202,7 +202,7 @@ function mergeAutonomyConfig(
   existing: CronAutonomyConfig | undefined,
   patch: CronAutonomyConfig,
 ): CronAutonomyConfig {
-  const next: CronAutonomyConfig = { ...(existing ?? {}) };
+  const next: CronAutonomyConfig = { ...existing };
   if (typeof patch.enabled === "boolean") {
     next.enabled = patch.enabled;
   }

@@ -165,10 +165,7 @@ export async function loadAutonomyState(params: {
       state.dedupeWindowMs,
     );
     state.maxQueuedEvents = clampInt(parsed.maxQueuedEvents, 1, 500, state.maxQueuedEvents);
-    state.dedupe =
-      parsed.dedupe && typeof parsed.dedupe === "object"
-        ? { ...(parsed.dedupe as Record<string, number>) }
-        : {};
+    state.dedupe = parsed.dedupe && typeof parsed.dedupe === "object" ? { ...parsed.dedupe } : {};
     state.goals = Array.isArray(parsed.goals) ? parsed.goals : [];
     state.tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
     state.recentEvents = Array.isArray(parsed.recentEvents)
