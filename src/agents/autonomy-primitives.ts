@@ -1,9 +1,9 @@
-const DEFAULT_MISSION =
+export const DEFAULT_AUTONOMY_MISSION =
   "Continuously pursue useful long-term goals, using real external signals and safe delegated execution.";
-const DEFAULT_GOALS_FILE = "AUTONOMY_GOALS.md";
-const DEFAULT_TASKS_FILE = "AUTONOMY_TASKS.md";
-const DEFAULT_LOG_FILE = "AUTONOMY_LOG.md";
-const DEFAULT_MAX_ACTIONS_PER_RUN = 3;
+export const DEFAULT_AUTONOMY_GOALS_FILE = "AUTONOMY_GOALS.md";
+export const DEFAULT_AUTONOMY_TASKS_FILE = "AUTONOMY_TASKS.md";
+export const DEFAULT_AUTONOMY_LOG_FILE = "AUTONOMY_LOG.md";
+export const DEFAULT_AUTONOMY_MAX_ACTIONS_PER_RUN = 3;
 
 export type AutonomousPromptOptions = {
   mission?: string;
@@ -13,7 +13,7 @@ export type AutonomousPromptOptions = {
   maxActionsPerRun?: number;
 };
 
-function normalizeText(value: string | undefined, fallback: string) {
+export function normalizeAutonomyText(value: string | undefined, fallback: string) {
   const trimmed = (value ?? "").trim();
   if (!trimmed) {
     return fallback;
@@ -21,24 +21,24 @@ function normalizeText(value: string | undefined, fallback: string) {
   return trimmed.replace(/\s+/g, " ");
 }
 
-function normalizeFilePath(value: string | undefined, fallback: string) {
+export function normalizeAutonomyFilePath(value: string | undefined, fallback: string) {
   const trimmed = (value ?? "").trim();
   return trimmed || fallback;
 }
 
-function normalizeMaxActions(value: number | undefined) {
+export function normalizeAutonomyMaxActions(value: number | undefined) {
   if (!Number.isFinite(value)) {
-    return DEFAULT_MAX_ACTIONS_PER_RUN;
+    return DEFAULT_AUTONOMY_MAX_ACTIONS_PER_RUN;
   }
   return Math.max(1, Math.min(20, Math.floor(value as number)));
 }
 
 export function buildAutonomousCoordinationPrompt(opts: AutonomousPromptOptions) {
-  const mission = normalizeText(opts.mission, DEFAULT_MISSION);
-  const goalsFile = normalizeFilePath(opts.goalsFile, DEFAULT_GOALS_FILE);
-  const tasksFile = normalizeFilePath(opts.tasksFile, DEFAULT_TASKS_FILE);
-  const logFile = normalizeFilePath(opts.logFile, DEFAULT_LOG_FILE);
-  const maxActions = normalizeMaxActions(opts.maxActionsPerRun);
+  const mission = normalizeAutonomyText(opts.mission, DEFAULT_AUTONOMY_MISSION);
+  const goalsFile = normalizeAutonomyFilePath(opts.goalsFile, DEFAULT_AUTONOMY_GOALS_FILE);
+  const tasksFile = normalizeAutonomyFilePath(opts.tasksFile, DEFAULT_AUTONOMY_TASKS_FILE);
+  const logFile = normalizeAutonomyFilePath(opts.logFile, DEFAULT_AUTONOMY_LOG_FILE);
+  const maxActions = normalizeAutonomyMaxActions(opts.maxActionsPerRun);
 
   const lines = [
     "You are the autonomous engine for this workspace.",
@@ -89,5 +89,47 @@ export function buildAutonomousCoordinationPrompt(opts: AutonomousPromptOptions)
     "- Prefer reversible, observable steps with clear rollback paths.",
     "- If no high-value action exists, record HEARTBEAT_OK with reason and stop.",
   ];
+  return lines.join("\n");
+}
+
+export type AutonomousCycleContext = {
+  nowIso: string;
+  queuedEvents: Array<{ source: string; type: string; ts: number; dedupeKey?: string }>;
+  recentCycleOutcomes: Array<{ ts: number; status: string; summary?: string }>;
+  blockedTaskCount: number;
+  inProgressTaskCount: number;
+  pendingTaskCount: number;
+};
+
+export function buildAutonomousCyclePreamble(context: AutonomousCycleContext) {
+  const lines = [
+    "# Cycle Context",
+    "",
+    `Cycle started at: ${context.nowIso}`,
+    `Queued signals: ${context.queuedEvents.length}`,
+    `Tasks in progress: ${context.inProgressTaskCount}`,
+    `Tasks blocked: ${context.blockedTaskCount}`,
+    `Tasks pending: ${context.pendingTaskCount}`,
+    "",
+  ];
+  if (context.queuedEvents.length > 0) {
+    lines.push("Signals in this cycle:");
+    for (const event of context.queuedEvents) {
+      const atIso = new Date(event.ts).toISOString();
+      const dedupe = event.dedupeKey ? ` (dedupe=${event.dedupeKey})` : "";
+      lines.push(`- [${event.source}] ${event.type} at ${atIso}${dedupe}`);
+    }
+    lines.push("");
+  }
+  if (context.recentCycleOutcomes.length > 0) {
+    lines.push("Recent cycle outcomes:");
+    for (const cycle of context.recentCycleOutcomes.slice(-3)) {
+      const atIso = new Date(cycle.ts).toISOString();
+      const summary = cycle.summary ? ` - ${cycle.summary}` : "";
+      lines.push(`- ${atIso}: ${cycle.status}${summary}`);
+    }
+    lines.push("");
+  }
+  lines.push("Apply coordination and task primitives strictly in this cycle.");
   return lines.join("\n");
 }

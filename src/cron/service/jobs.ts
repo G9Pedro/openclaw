@@ -6,6 +6,7 @@ import type {
   CronPayload,
   CronPayloadPatch,
 } from "../types.js";
+import type { CronAutonomyConfig } from "../types.js";
 import type { CronServiceState } from "./state.js";
 import { computeNextRunAtMs } from "../schedule.js";
 import {
@@ -191,6 +192,44 @@ function mergeCronPayload(existing: CronPayload, patch: CronPayloadPatch): CronP
   if (typeof patch.bestEffortDeliver === "boolean") {
     next.bestEffortDeliver = patch.bestEffortDeliver;
   }
+  if (patch.autonomy && typeof patch.autonomy === "object") {
+    next.autonomy = mergeAutonomyConfig(next.autonomy, patch.autonomy);
+  }
+  return next;
+}
+
+function mergeAutonomyConfig(
+  existing: CronAutonomyConfig | undefined,
+  patch: CronAutonomyConfig,
+): CronAutonomyConfig {
+  const next: CronAutonomyConfig = { ...(existing ?? {}) };
+  if (typeof patch.enabled === "boolean") {
+    next.enabled = patch.enabled;
+  }
+  if (typeof patch.paused === "boolean") {
+    next.paused = patch.paused;
+  }
+  if (typeof patch.mission === "string") {
+    next.mission = patch.mission;
+  }
+  if (typeof patch.goalsFile === "string") {
+    next.goalsFile = patch.goalsFile;
+  }
+  if (typeof patch.tasksFile === "string") {
+    next.tasksFile = patch.tasksFile;
+  }
+  if (typeof patch.logFile === "string") {
+    next.logFile = patch.logFile;
+  }
+  if (typeof patch.maxActionsPerRun === "number" && Number.isFinite(patch.maxActionsPerRun)) {
+    next.maxActionsPerRun = patch.maxActionsPerRun;
+  }
+  if (typeof patch.dedupeWindowMinutes === "number" && Number.isFinite(patch.dedupeWindowMinutes)) {
+    next.dedupeWindowMinutes = patch.dedupeWindowMinutes;
+  }
+  if (typeof patch.maxQueuedEvents === "number" && Number.isFinite(patch.maxQueuedEvents)) {
+    next.maxQueuedEvents = patch.maxQueuedEvents;
+  }
   return next;
 }
 
@@ -216,6 +255,7 @@ function buildPayloadFromPatch(patch: CronPayloadPatch): CronPayload {
     channel: patch.channel,
     to: patch.to,
     bestEffortDeliver: patch.bestEffortDeliver,
+    autonomy: patch.autonomy,
   };
 }
 

@@ -40,6 +40,7 @@ import {
   normalizeVerboseLevel,
   supportsXHighThinking,
 } from "../../auto-reply/thinking.js";
+import { finalizeAutonomyRuntime, prepareAutonomyRuntime } from "../../autonomy/runtime.js";
 import { createOutboundSendDeps, type CliDeps } from "../../cli/outbound-send-deps.js";
 import { resolveSessionTranscriptPath, updateSessionStore } from "../../config/sessions.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
@@ -231,12 +232,55 @@ export async function runCronIsolatedAgentTurn(params: {
   });
 
   const agentPayload = params.job.payload.kind === "agentTurn" ? params.job.payload : null;
+  const autonomyConfig = agentPayload?.autonomy;
   const deliveryMode =
     agentPayload?.deliver === true ? "explicit" : agentPayload?.deliver === false ? "off" : "auto";
   const hasExplicitTarget = Boolean(agentPayload?.to && agentPayload.to.trim());
   const deliveryRequested =
     deliveryMode === "explicit" || (deliveryMode === "auto" && hasExplicitTarget);
   const bestEffortDeliver = agentPayload?.bestEffortDeliver === true;
+
+  const autonomyRuntime =
+    autonomyConfig?.enabled === true
+      ? await prepareAutonomyRuntime({
+          agentId,
+          workspaceDir,
+          autonomy: autonomyConfig,
+        })
+      : undefined;
+  if (autonomyRuntime && "skipped" in autonomyRuntime) {
+    await finalizeAutonomyRuntime({
+      workspaceDir,
+      state: autonomyRuntime.state,
+      cycleStartedAt: Date.now(),
+      status: "skipped",
+      summary: autonomyRuntime.reason,
+      events: [],
+      droppedDuplicates: 0,
+      remainingEvents: 0,
+    });
+    return { status: "skipped", summary: autonomyRuntime.reason };
+  }
+  const completeAutonomyCycle = async (params: {
+    status: "ok" | "error" | "skipped";
+    summary?: string;
+    error?: string;
+  }) => {
+    if (!autonomyRuntime || "skipped" in autonomyRuntime) {
+      return;
+    }
+    await finalizeAutonomyRuntime({
+      workspaceDir,
+      state: autonomyRuntime.state,
+      cycleStartedAt: autonomyRuntime.cycleStartedAt,
+      status: params.status,
+      summary: params.summary,
+      error: params.error,
+      events: autonomyRuntime.events,
+      droppedDuplicates: autonomyRuntime.droppedDuplicates,
+      remainingEvents: autonomyRuntime.remainingEvents,
+    });
+  };
 
   const resolvedDelivery = await resolveDeliveryTarget(cfgWithAgentDefaults, agentId, {
     channel: agentPayload?.channel ?? "last",
@@ -248,7 +292,21 @@ export async function runCronIsolatedAgentTurn(params: {
   const formattedTime =
     formatUserTime(new Date(now), userTimezone, userTimeFormat) ?? new Date(now).toISOString();
   const timeLine = `Current time: ${formattedTime} (${userTimezone})`;
-  const base = `[cron:${params.job.id} ${params.job.name}] ${params.message}`.trim();
+  const autonomyBody =
+    autonomyRuntime && !("skipped" in autonomyRuntime)
+      ? [
+          `[cron:${params.job.id} ${params.job.name}] autonomous cycle`,
+          "",
+          autonomyRuntime.prompt,
+          params.message.trim()
+            ? `\n\nOperator objective for this job:\n${params.message.trim()}`
+            : "",
+        ]
+          .join("\n")
+          .trim()
+      : null;
+  const base =
+    autonomyBody ?? `[cron:${params.job.id} ${params.job.name}] ${params.message}`.trim();
 
   // SECURITY: Wrap external hook content with security boundaries to prevent prompt injection
   // unless explicitly allowed via a dangerous config override.
@@ -380,7 +438,12 @@ export async function runCronIsolatedAgentTurn(params: {
     fallbackProvider = fallbackResult.provider;
     fallbackModel = fallbackResult.model;
   } catch (err) {
-    return { status: "error", error: String(err) };
+    const error = String(err);
+    await completeAutonomyCycle({
+      status: "error",
+      error,
+    });
+    return { status: "error", error };
   }
 
   const payloads = runResult.payloads ?? [];
@@ -440,6 +503,11 @@ export async function runCronIsolatedAgentTurn(params: {
       const reason =
         resolvedDelivery.error?.message ?? "Cron delivery requires a recipient (--to).";
       if (!bestEffortDeliver) {
+        await completeAutonomyCycle({
+          status: "error",
+          summary,
+          error: reason,
+        });
         return {
           status: "error",
           summary,
@@ -447,6 +515,10 @@ export async function runCronIsolatedAgentTurn(params: {
           error: reason,
         };
       }
+      await completeAutonomyCycle({
+        status: "skipped",
+        summary: `Delivery skipped (${reason}).`,
+      });
       return {
         status: "skipped",
         summary: `Delivery skipped (${reason}).`,
@@ -465,11 +537,25 @@ export async function runCronIsolatedAgentTurn(params: {
       });
     } catch (err) {
       if (!bestEffortDeliver) {
-        return { status: "error", summary, outputText, error: String(err) };
+        const error = String(err);
+        await completeAutonomyCycle({
+          status: "error",
+          summary,
+          error,
+        });
+        return { status: "error", summary, outputText, error };
       }
+      await completeAutonomyCycle({
+        status: "ok",
+        summary,
+      });
       return { status: "ok", summary, outputText };
     }
   }
 
+  await completeAutonomyCycle({
+    status: "ok",
+    summary,
+  });
   return { status: "ok", summary, outputText };
 }

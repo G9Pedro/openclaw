@@ -1,0 +1,416 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import type {
+  AutonomyCycleRecord,
+  AutonomyEvent,
+  AutonomyEventSource,
+  AutonomyState,
+} from "./types.js";
+import { normalizeAgentId } from "../routing/session-key.js";
+import { CONFIG_DIR } from "../utils.js";
+
+const AUTONOMY_DIR = path.join(CONFIG_DIR, "autonomy");
+const STATE_FILENAME = "state.json";
+const EVENTS_FILENAME = "events.jsonl";
+const MAX_RECENT_EVENTS = 50;
+const MAX_RECENT_CYCLES = 50;
+const DEFAULT_DEDUPE_WINDOW_MS = 60 * 60_000;
+const DEFAULT_MAX_QUEUED_EVENTS = 100;
+
+const writesByPath = new Map<string, Promise<void>>();
+
+type PartialAutonomyState = Partial<
+  Pick<
+    AutonomyState,
+    | "mission"
+    | "paused"
+    | "goalsFile"
+    | "tasksFile"
+    | "logFile"
+    | "maxActionsPerRun"
+    | "dedupeWindowMs"
+    | "maxQueuedEvents"
+  >
+>;
+
+function normalizeOptionalString(value: unknown) {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function clampInt(value: number | undefined, min: number, max: number, fallback: number) {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(value as number)));
+}
+
+function resolveEventDedupeKey(event: AutonomyEvent) {
+  if (event.dedupeKey?.trim()) {
+    return event.dedupeKey.trim();
+  }
+  if (event.id.trim()) {
+    return event.id.trim();
+  }
+  return `${event.source}:${event.type}`;
+}
+
+function pruneDedupeMap(state: AutonomyState, nowMs: number) {
+  const minTs = nowMs - Math.max(state.dedupeWindowMs * 3, state.dedupeWindowMs);
+  for (const [key, ts] of Object.entries(state.dedupe)) {
+    if (!Number.isFinite(ts) || ts < minTs) {
+      delete state.dedupe[key];
+    }
+  }
+}
+
+function withSerializedWrite(filePath: string, run: () => Promise<void>) {
+  const resolved = path.resolve(filePath);
+  const prev = writesByPath.get(resolved) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(run);
+  writesByPath.set(resolved, next);
+  return next;
+}
+
+function buildDefaultState(agentId: string, defaults?: PartialAutonomyState): AutonomyState {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const dedupeWindowMs = clampInt(
+    defaults?.dedupeWindowMs,
+    60_000,
+    24 * 60 * 60_000,
+    DEFAULT_DEDUPE_WINDOW_MS,
+  );
+  return {
+    version: 1,
+    agentId: normalizedAgentId,
+    mission:
+      normalizeOptionalString(defaults?.mission) ??
+      "Continuously pursue useful long-term goals using external signals and delegated work.",
+    paused: defaults?.paused === true,
+    goalsFile: normalizeOptionalString(defaults?.goalsFile) ?? "AUTONOMY_GOALS.md",
+    tasksFile: normalizeOptionalString(defaults?.tasksFile) ?? "AUTONOMY_TASKS.md",
+    logFile: normalizeOptionalString(defaults?.logFile) ?? "AUTONOMY_LOG.md",
+    maxActionsPerRun: clampInt(defaults?.maxActionsPerRun, 1, 20, 3),
+    dedupeWindowMs,
+    maxQueuedEvents: clampInt(defaults?.maxQueuedEvents, 1, 500, DEFAULT_MAX_QUEUED_EVENTS),
+    dedupe: {},
+    goals: [],
+    tasks: [],
+    recentEvents: [],
+    recentCycles: [],
+    metrics: {
+      cycles: 0,
+      ok: 0,
+      error: 0,
+      skipped: 0,
+    },
+  };
+}
+
+export function resolveAutonomyAgentDir(agentId: string) {
+  return path.join(AUTONOMY_DIR, normalizeAgentId(agentId));
+}
+
+export function resolveAutonomyStatePath(agentId: string) {
+  return path.join(resolveAutonomyAgentDir(agentId), STATE_FILENAME);
+}
+
+export function resolveAutonomyEventsPath(agentId: string) {
+  return path.join(resolveAutonomyAgentDir(agentId), EVENTS_FILENAME);
+}
+
+export async function hasAutonomyState(agentId: string) {
+  const statePath = resolveAutonomyStatePath(agentId);
+  try {
+    await fs.access(statePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function loadAutonomyState(params: {
+  agentId: string;
+  defaults?: PartialAutonomyState;
+}): Promise<AutonomyState> {
+  const statePath = resolveAutonomyStatePath(params.agentId);
+  const raw = await fs.readFile(statePath, "utf-8").catch(() => "");
+  if (!raw.trim()) {
+    const state = buildDefaultState(params.agentId, params.defaults);
+    await saveAutonomyState(state);
+    return state;
+  }
+  let parsed: Partial<AutonomyState> | null = null;
+  try {
+    parsed = JSON.parse(raw) as Partial<AutonomyState>;
+  } catch {
+    parsed = null;
+  }
+  const state = buildDefaultState(params.agentId, params.defaults);
+  if (parsed && typeof parsed === "object") {
+    state.mission = normalizeOptionalString(parsed.mission) ?? state.mission;
+    state.paused = parsed.paused === true;
+    state.goalsFile = normalizeOptionalString(parsed.goalsFile) ?? state.goalsFile;
+    state.tasksFile = normalizeOptionalString(parsed.tasksFile) ?? state.tasksFile;
+    state.logFile = normalizeOptionalString(parsed.logFile) ?? state.logFile;
+    state.maxActionsPerRun = clampInt(parsed.maxActionsPerRun, 1, 20, state.maxActionsPerRun);
+    state.dedupeWindowMs = clampInt(
+      parsed.dedupeWindowMs,
+      60_000,
+      24 * 60 * 60_000,
+      state.dedupeWindowMs,
+    );
+    state.maxQueuedEvents = clampInt(parsed.maxQueuedEvents, 1, 500, state.maxQueuedEvents);
+    state.dedupe =
+      parsed.dedupe && typeof parsed.dedupe === "object"
+        ? { ...(parsed.dedupe as Record<string, number>) }
+        : {};
+    state.goals = Array.isArray(parsed.goals) ? parsed.goals : [];
+    state.tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    state.recentEvents = Array.isArray(parsed.recentEvents)
+      ? parsed.recentEvents.slice(-MAX_RECENT_EVENTS)
+      : [];
+    state.recentCycles = Array.isArray(parsed.recentCycles)
+      ? parsed.recentCycles.slice(-MAX_RECENT_CYCLES)
+      : [];
+    state.metrics =
+      parsed.metrics && typeof parsed.metrics === "object"
+        ? {
+            cycles: Number.isFinite(parsed.metrics.cycles) ? Math.max(0, parsed.metrics.cycles) : 0,
+            ok: Number.isFinite(parsed.metrics.ok) ? Math.max(0, parsed.metrics.ok) : 0,
+            error: Number.isFinite(parsed.metrics.error) ? Math.max(0, parsed.metrics.error) : 0,
+            skipped: Number.isFinite(parsed.metrics.skipped)
+              ? Math.max(0, parsed.metrics.skipped)
+              : 0,
+            lastCycleAt: Number.isFinite(parsed.metrics.lastCycleAt)
+              ? parsed.metrics.lastCycleAt
+              : undefined,
+            lastError:
+              typeof parsed.metrics.lastError === "string" ? parsed.metrics.lastError : undefined,
+          }
+        : state.metrics;
+  }
+  return state;
+}
+
+export async function saveAutonomyState(state: AutonomyState) {
+  const statePath = resolveAutonomyStatePath(state.agentId);
+  const payload = JSON.stringify(state, null, 2);
+  await withSerializedWrite(statePath, async () => {
+    await fs.mkdir(path.dirname(statePath), { recursive: true });
+    const tmp = `${statePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+    await fs.writeFile(tmp, payload, "utf-8");
+    await fs.rename(tmp, statePath);
+  });
+}
+
+export async function enqueueAutonomyEvent(params: {
+  agentId: string;
+  source: AutonomyEventSource;
+  type: string;
+  dedupeKey?: string;
+  payload?: Record<string, unknown>;
+  ts?: number;
+}): Promise<AutonomyEvent> {
+  const event: AutonomyEvent = {
+    id: crypto.randomUUID(),
+    source: params.source,
+    type: params.type.trim() || "event",
+    ts: Number.isFinite(params.ts) ? (params.ts as number) : Date.now(),
+    dedupeKey: normalizeOptionalString(params.dedupeKey),
+    payload: params.payload,
+  };
+  const eventsPath = resolveAutonomyEventsPath(params.agentId);
+  await withSerializedWrite(eventsPath, async () => {
+    await fs.mkdir(path.dirname(eventsPath), { recursive: true });
+    await fs.appendFile(eventsPath, `${JSON.stringify(event)}\n`, "utf-8");
+  });
+  return event;
+}
+
+export async function drainAutonomyEvents(params: {
+  agentId: string;
+  state: AutonomyState;
+  maxEvents?: number;
+  nowMs?: number;
+}) {
+  const eventsPath = resolveAutonomyEventsPath(params.agentId);
+  const maxEvents = clampInt(params.maxEvents, 1, 500, params.state.maxQueuedEvents);
+  const nowMs = Number.isFinite(params.nowMs) ? (params.nowMs as number) : Date.now();
+  const raw = await fs.readFile(eventsPath, "utf-8").catch(() => "");
+  if (!raw.trim()) {
+    pruneDedupeMap(params.state, nowMs);
+    return { events: [] as AutonomyEvent[], droppedDuplicates: 0, remaining: 0 };
+  }
+
+  const lines = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const selected: AutonomyEvent[] = [];
+  const remaining: AutonomyEvent[] = [];
+  let droppedDuplicates = 0;
+  for (const line of lines) {
+    let parsed: AutonomyEvent | null = null;
+    try {
+      parsed = JSON.parse(line) as AutonomyEvent;
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const event: AutonomyEvent = {
+      id: normalizeOptionalString(parsed.id) ?? crypto.randomUUID(),
+      source: parsed.source,
+      type: normalizeOptionalString(parsed.type) ?? "event",
+      ts: Number.isFinite(parsed.ts) ? parsed.ts : nowMs,
+      dedupeKey: normalizeOptionalString(parsed.dedupeKey),
+      payload:
+        parsed.payload && typeof parsed.payload === "object" && !Array.isArray(parsed.payload)
+          ? parsed.payload
+          : undefined,
+    };
+
+    if (selected.length >= maxEvents) {
+      remaining.push(event);
+      continue;
+    }
+    const key = resolveEventDedupeKey(event);
+    const seenAt = params.state.dedupe[key];
+    if (Number.isFinite(seenAt) && nowMs - seenAt < params.state.dedupeWindowMs) {
+      droppedDuplicates += 1;
+      continue;
+    }
+    params.state.dedupe[key] = nowMs;
+    selected.push(event);
+  }
+
+  pruneDedupeMap(params.state, nowMs);
+
+  const serializedRemaining =
+    remaining.length > 0 ? `${remaining.map((event) => JSON.stringify(event)).join("\n")}\n` : "";
+  await withSerializedWrite(eventsPath, async () => {
+    await fs.mkdir(path.dirname(eventsPath), { recursive: true });
+    await fs.writeFile(eventsPath, serializedRemaining, "utf-8");
+  });
+
+  return { events: selected, droppedDuplicates, remaining: remaining.length };
+}
+
+export function recordAutonomyCycle(state: AutonomyState, cycle: AutonomyCycleRecord) {
+  state.metrics.cycles += 1;
+  state.metrics.lastCycleAt = cycle.ts;
+  if (cycle.status === "ok") {
+    state.metrics.ok += 1;
+  } else if (cycle.status === "error") {
+    state.metrics.error += 1;
+    state.metrics.lastError = cycle.error;
+  } else {
+    state.metrics.skipped += 1;
+  }
+  state.recentCycles = [...state.recentCycles, cycle].slice(-MAX_RECENT_CYCLES);
+}
+
+export function recordAutonomyEvents(state: AutonomyState, events: AutonomyEvent[]) {
+  if (events.length === 0) {
+    return;
+  }
+  state.recentEvents = [...state.recentEvents, ...events].slice(-MAX_RECENT_EVENTS);
+}
+
+function resolveWorkspaceFile(workspaceDir: string, filePath: string) {
+  if (path.isAbsolute(filePath)) {
+    return path.resolve(filePath);
+  }
+  return path.resolve(workspaceDir, filePath);
+}
+
+async function ensureFileIfMissing(filePath: string, initialContent: string) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const existing = await fs.readFile(filePath, "utf-8").catch(() => null);
+  if (existing !== null) {
+    return;
+  }
+  await fs.writeFile(filePath, initialContent, "utf-8");
+}
+
+export async function ensureAutonomyWorkspaceFiles(params: {
+  workspaceDir: string;
+  state: Pick<AutonomyState, "mission" | "goalsFile" | "tasksFile" | "logFile">;
+}) {
+  const goalsPath = resolveWorkspaceFile(params.workspaceDir, params.state.goalsFile);
+  const tasksPath = resolveWorkspaceFile(params.workspaceDir, params.state.tasksFile);
+  const logPath = resolveWorkspaceFile(params.workspaceDir, params.state.logFile);
+  await ensureFileIfMissing(
+    goalsPath,
+    [
+      "# Autonomy Goals",
+      "",
+      `Mission: ${params.state.mission}`,
+      "",
+      "## Active goals",
+      "- (add goals with impact/urgency/confidence)",
+      "",
+    ].join("\n"),
+  );
+  await ensureFileIfMissing(
+    tasksPath,
+    [
+      "# Autonomy Tasks",
+      "",
+      "Track task primitives here (CREATE/START/BLOCK/COMPLETE/CANCEL/FOLLOWUP).",
+      "",
+      "| id | title | status | priority | dependencies | owner |",
+      "|---|---|---|---|---|---|",
+      "",
+    ].join("\n"),
+  );
+  await ensureFileIfMissing(
+    logPath,
+    ["# Autonomy Log", "", "Run-by-run execution notes, evidence, and trigger decisions.", ""].join(
+      "\n",
+    ),
+  );
+}
+
+export async function appendAutonomyWorkspaceLog(params: {
+  workspaceDir: string;
+  logFile: string;
+  nowMs: number;
+  status: "ok" | "error" | "skipped";
+  summary?: string;
+  error?: string;
+  processedEvents: AutonomyEvent[];
+  droppedDuplicates?: number;
+  remainingEvents?: number;
+}) {
+  const logPath = resolveWorkspaceFile(params.workspaceDir, params.logFile);
+  const lines = [
+    `## ${new Date(params.nowMs).toISOString()} - ${params.status.toUpperCase()}`,
+    "",
+    params.summary ? `Summary: ${params.summary}` : undefined,
+    params.error ? `Error: ${params.error}` : undefined,
+    `Processed events: ${params.processedEvents.length}`,
+    typeof params.droppedDuplicates === "number"
+      ? `Dropped duplicate events: ${params.droppedDuplicates}`
+      : undefined,
+    typeof params.remainingEvents === "number"
+      ? `Queued events remaining: ${params.remainingEvents}`
+      : undefined,
+    params.processedEvents.length > 0 ? "Event digest:" : undefined,
+    ...params.processedEvents.map((event) => {
+      const dedupe = event.dedupeKey ? ` (dedupe=${event.dedupeKey})` : "";
+      return `- [${event.source}] ${event.type}${dedupe}`;
+    }),
+    "",
+  ].filter((line): line is string => typeof line === "string");
+  await withSerializedWrite(logPath, async () => {
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    await fs.appendFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+  });
+}

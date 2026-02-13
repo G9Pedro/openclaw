@@ -373,7 +373,7 @@ describe("cron cli", () => {
     expect(patch?.patch?.payload?.bestEffortDeliver).toBe(false);
   });
 
-  it("creates autonomous cron job with coordination and task primitives", async () => {
+  it("creates autonomous cron job with runtime autonomy config", async () => {
     callGatewayFromCli.mockClear();
 
     const { registerCronCli } = await import("./cron-cli.js");
@@ -390,7 +390,16 @@ describe("cron cli", () => {
     const params = addCall?.[2] as {
       sessionTarget?: string;
       schedule?: { kind?: string; everyMs?: number };
-      payload?: { kind?: string; message?: string };
+      payload?: {
+        kind?: string;
+        message?: string;
+        autonomy?: {
+          enabled?: boolean;
+          paused?: boolean;
+          mission?: string;
+          maxActionsPerRun?: number;
+        };
+      };
       isolation?: { postToMainPrefix?: string };
     };
 
@@ -398,9 +407,11 @@ describe("cron cli", () => {
     expect(params?.schedule?.kind).toBe("every");
     expect(params?.schedule?.everyMs).toBe(600_000);
     expect(params?.payload?.kind).toBe("agentTurn");
-    expect(params?.payload?.message).toContain("Coordination primitives:");
-    expect(params?.payload?.message).toContain("Task primitives (state machine):");
-    expect(params?.payload?.message).toContain("Ship high-impact outcomes continuously");
+    expect(params?.payload?.message).toContain("Run autonomous coordination cycle");
+    expect(params?.payload?.autonomy?.enabled).toBe(true);
+    expect(params?.payload?.autonomy?.paused).toBe(false);
+    expect(params?.payload?.autonomy?.mission).toContain("Ship high-impact outcomes continuously");
+    expect(params?.payload?.autonomy?.maxActionsPerRun).toBe(3);
     expect(params?.isolation?.postToMainPrefix).toBe("Autonomy");
   });
 
@@ -457,6 +468,14 @@ describe("cron cli", () => {
         to?: string;
         bestEffortDeliver?: boolean;
         message?: string;
+        autonomy?: {
+          goalsFile?: string;
+          tasksFile?: string;
+          logFile?: string;
+          maxActionsPerRun?: number;
+          dedupeWindowMinutes?: number;
+          maxQueuedEvents?: number;
+        };
       };
     };
 
@@ -470,9 +489,67 @@ describe("cron cli", () => {
     expect(params?.payload?.channel).toBe("telegram");
     expect(params?.payload?.to).toBe("19098680");
     expect(params?.payload?.bestEffortDeliver).toBe(true);
-    expect(params?.payload?.message).toContain("Goals file: GOALS.md");
-    expect(params?.payload?.message).toContain("Tasks file: TASKS.md");
-    expect(params?.payload?.message).toContain("Execution log: LOG.md");
-    expect(params?.payload?.message).toContain("Execute at most 7 meaningful actions this run.");
+    expect(params?.payload?.autonomy?.goalsFile).toBe("GOALS.md");
+    expect(params?.payload?.autonomy?.tasksFile).toBe("TASKS.md");
+    expect(params?.payload?.autonomy?.logFile).toBe("LOG.md");
+    expect(params?.payload?.autonomy?.maxActionsPerRun).toBe(7);
+    expect(params?.payload?.autonomy?.dedupeWindowMinutes).toBe(60);
+    expect(params?.payload?.autonomy?.maxQueuedEvents).toBe(100);
+  });
+
+  it("pauses and resumes autonomous jobs via cron.update", async () => {
+    callGatewayFromCli.mockClear();
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(["cron", "autonomous-pause", "job-1"], { from: "user" });
+    const pauseCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.update");
+    const pausePatch = pauseCall?.[2] as {
+      patch?: { payload?: { kind?: string; autonomy?: { enabled?: boolean; paused?: boolean } } };
+    };
+    expect(pausePatch?.patch?.payload?.kind).toBe("agentTurn");
+    expect(pausePatch?.patch?.payload?.autonomy?.enabled).toBe(true);
+    expect(pausePatch?.patch?.payload?.autonomy?.paused).toBe(true);
+
+    callGatewayFromCli.mockClear();
+    await program.parseAsync(["cron", "autonomous-resume", "job-1"], { from: "user" });
+    const resumeCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.update");
+    const resumePatch = resumeCall?.[2] as {
+      patch?: { payload?: { kind?: string; autonomy?: { enabled?: boolean; paused?: boolean } } };
+    };
+    expect(resumePatch?.patch?.payload?.kind).toBe("agentTurn");
+    expect(resumePatch?.patch?.payload?.autonomy?.enabled).toBe(true);
+    expect(resumePatch?.patch?.payload?.autonomy?.paused).toBe(false);
+  });
+
+  it("lists autonomous jobs via autonomous-status", async () => {
+    callGatewayFromCli.mockClear();
+    callGatewayFromCli.mockImplementationOnce(async () => ({
+      jobs: [
+        {
+          id: "job-1",
+          name: "autonomy",
+          enabled: true,
+          agentId: "ops",
+          state: { nextRunAtMs: 1_700_000_000_000 },
+          payload: {
+            kind: "agentTurn",
+            autonomy: { enabled: true, paused: false },
+          },
+        },
+      ],
+    }));
+
+    const { registerCronCli } = await import("./cron-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerCronCli(program);
+
+    await program.parseAsync(["cron", "autonomous-status", "--json"], { from: "user" });
+    const listCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.list");
+    expect(listCall?.[2]).toEqual({ includeDisabled: true });
   });
 });
