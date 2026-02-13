@@ -106,7 +106,7 @@ function pruneDedupeMap(state: AutonomyState, nowMs: number) {
   }
   const entries = Object.entries(state.dedupe)
     .filter(([, ts]) => Number.isFinite(ts))
-    .sort((a, b) => (b[1] as number) - (a[1] as number));
+    .toSorted((a, b) => b[1] - a[1]);
   if (entries.length <= MAX_DEDUPE_ENTRIES) {
     return;
   }
